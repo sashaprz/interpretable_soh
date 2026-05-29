@@ -1,4 +1,4 @@
-"""
+﻿"""
 ica.py
 ======
 Incremental Capacity Analysis (dQ/dV) on parsed cycle objects.
@@ -43,7 +43,7 @@ from scipy.signal import savgol_filter, find_peaks
 
 logger = logging.getLogger("ica")
 
-ICA_VERSION = "1.0.0"
+ICA_VERSION = "1.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +301,7 @@ def compute_ica_for_half(cycle: dict, half: str, cfg: ICAConfig,
             "residual_frac": float(resid_frac),
             "peak_shift_mv": float(max_shift_mv),
             "direction": 1.0 if direction == "up" else -1.0,
+            "grid_spacing_mV": cfg.dv_mv,
         },
     )
 
