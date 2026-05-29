@@ -346,7 +346,7 @@ def build_cycle_object(cycle_id: int, sub: pd.DataFrame,
         i = half["current"].abs().to_numpy()
         if len(t) < 2:
             return 0.0
-        return float(np.trapz(i, t) / 3600.0)
+        return float(np.trapezoid(i, t) / 3600.0)
 
     flags: list[str] = []
     if n < cfg.min_points_per_cycle:

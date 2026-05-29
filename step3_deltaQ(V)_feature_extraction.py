@@ -342,7 +342,7 @@ def _feat_variance(x, dv):      return float(np.var(x))
 def _feat_log_variance(x, dv):  return float(np.log(np.var(x) + 1e-30))
 def _feat_skewness(x, dv):      return float(scipy_skew(x))
 def _feat_kurtosis(x, dv):      return float(scipy_kurtosis(x, fisher=True))
-def _feat_integral_abs(x, dv):  return float(np.trapz(np.abs(x)) * dv)
+def _feat_integral_abs(x, dv):  return float(np.trapezoid(np.abs(x)) * dv)
 def _feat_max_deviation(x, dv): return float(np.max(np.abs(x)))
 def _feat_min(x, dv):           return float(np.min(x))
 def _feat_max(x, dv):           return float(np.max(x))
@@ -502,7 +502,6 @@ class FeatureMatrixBuilder:
                 except ValueError as exc:
                     logger.error("Cell %s: %s -- NaN features for all cycles.", cell_id, exc)
                     ref_idx = None
-                ref_idx = None
 
             for rec in cell_recs:
                 row: Dict[str, Any] = {
