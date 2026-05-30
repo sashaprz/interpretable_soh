@@ -136,14 +136,13 @@ def train():
         _completed = 0
 
         def _timed(self, stage, cell_id, fn):
-            # Mark stage as started — bar advances halfway to next milestone immediately
-            half = min(0.93, (_TrackingRunner._completed + 0.4) / _total_steps)
-            _jobs[job_id]["progress"] = half
+            # Show stage starting — advance bar to start of this step
+            _jobs[job_id]["progress"] = (_TrackingRunner._completed + 0.3) / _total_steps * 0.90
             _jobs[job_id]["current_stage"] = f"{stage} · {cell_id}"
             result, sr = super()._timed(stage, cell_id, fn)
             if sr.status in ("ok", "skipped"):
                 _TrackingRunner._completed += 1
-                _jobs[job_id]["progress"] = min(0.93, _TrackingRunner._completed / _total_steps)
+                _jobs[job_id]["progress"] = _TrackingRunner._completed / _total_steps * 0.90
             return result, sr
 
     def run() -> None:

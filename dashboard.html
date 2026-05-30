@@ -1642,10 +1642,18 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
     );
   }
 
-  function Dropzone({ title, sub, onClick }) {
+  function Dropzone({ title, sub, onClick, onDrop }) {
+    const [over, setOver] = React.useState(false);
+    const handleDrag = (e) => { e.preventDefault(); setOver(true); };
+    const handleLeave = () => setOver(false);
+    const handleDrop = (e) => {
+      e.preventDefault(); setOver(false);
+      if (onDrop) { const fs = Array.from(e.dataTransfer.files); if (fs.length) onDrop(fs); }
+    };
     return (
-      <div onClick={onClick} style={{ border: '1.5px dashed var(--border)', borderRadius: 12, padding: '22px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 7, background: 'var(--panel)', cursor: onClick ? 'pointer' : 'default' }}>
-        <div style={{ width: 38, height: 38, borderRadius: 10, background: 'var(--accent-ghost)', display: 'grid', placeItems: 'center', color: 'var(--accent)', font: '300 21px/1 system-ui' }}>↥</div>
+      <div onClick={onClick} onDragOver={handleDrag} onDragEnter={handleDrag} onDragLeave={handleLeave} onDrop={handleDrop}
+        style={{ border: '1.5px dashed ' + (over ? 'var(--accent)' : 'var(--border)'), borderRadius: 12, padding: '22px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 7, background: over ? 'var(--accent-ghost)' : 'var(--panel)', cursor: onClick ? 'pointer' : 'default', transition: 'border-color .15s, background .15s' }}>
+        <div style={{ width: 38, height: 38, borderRadius: 10, background: over ? 'var(--accent)' : 'var(--accent-ghost)', display: 'grid', placeItems: 'center', color: over ? '#06120f' : 'var(--accent)', font: '300 21px/1 system-ui', transition: 'background .15s, color .15s' }}>↥</div>
         <div style={{ font: '600 12.5px/1.3 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>{title}</div>
         <div style={{ font: '400 10.5px/1.3 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>{sub}</div>
       </div>
@@ -1671,7 +1679,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
         <div style={{ width: 'min(820px, 100%)', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 15 }}>
           <BackLink onBack={onBack} label="Model library" crumb="Train new model" />
           <input ref={fileRef} type="file" multiple accept=".csv,.mat" style={{ display: 'none' }} onChange={onFiles} />
-          <Dropzone title={hasReal ? files.length + ' file' + (files.length > 1 ? 's' : '') + ' selected' : 'Click to upload cycle data'} sub={hasReal ? files.map(f => f.name).join(', ') : 'Oxford .mat or per-cell CSVs (time, voltage, current)'} onClick={() => fileRef.current && fileRef.current.click()} />
+          <Dropzone title={hasReal ? files.length + ' file' + (files.length > 1 ? 's' : '') + ' selected' : 'Click or drag cycle data here'} sub={hasReal ? files.map(f => f.name).join(', ') : 'Oxford .mat or per-cell CSVs (time, voltage, current)'} onClick={() => fileRef.current && fileRef.current.click()} onDrop={(dropped) => setFiles(dropped)} />
           {hasReal && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 9, padding: '10px 14px' }}>
               <span style={{ font: '500 11.5px/1 "IBM Plex Sans", sans-serif', color: 'var(--dim)', flex: '0 0 auto' }}>Nominal capacity (Ah)</span>
@@ -1736,7 +1744,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
             </div>
           )}
           <input ref={fileRef} type="file" accept=".csv,.mat" style={{ display: 'none' }} onChange={onFile} />
-          <Dropzone title={file ? file.name : 'Click to upload a cell to score'} sub={file ? (file.size / 1024).toFixed(0) + ' KB · click to change' : (model && !model.seed ? 'Oxford .mat or cycle CSV · same chemistry as training' : 'Upload a real cell or pick a demo below')} onClick={() => fileRef.current && fileRef.current.click()} />
+          <Dropzone title={file ? file.name : 'Click or drag a cell file here'} sub={file ? (file.size / 1024).toFixed(0) + ' KB · click to change' : (model && !model.seed ? 'Oxford .mat or cycle CSV · same chemistry as training' : 'Upload a real cell or pick a demo below')} onClick={() => fileRef.current && fileRef.current.click()} onDrop={(dropped) => { const f = dropped[0]; if (f) setFile(f); }} />
           {file && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 9, padding: '10px 14px' }}>
               <span style={{ font: '500 11.5px/1 "IBM Plex Sans", sans-serif', color: 'var(--dim)', flex: '0 0 auto' }}>Nominal capacity (Ah)</span>
@@ -1800,7 +1808,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
   const P = () => window.SOHFlowParts;
   const L = () => window.SOHLanding;
 
-  function TrainingStage({ cellIds, jobId, uploadPending, onDone }) {
+  function TrainingStage({ cellIds, jobId, uploadPending, uploadError, onDone, onBack }) {
     const data = window.SOHData;
     const [prog, setProg] = React.useState(0);
     const [fold, setFold] = React.useState(0);
@@ -1808,6 +1816,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
     const [errMsg, setErrMsg] = React.useState(null);
     React.useEffect(() => {
       if (uploadPending) return; // wait — fetch to /api/train hasn't resolved yet
+      if (uploadError) return;   // upload failed — don't start animation
       if (jobId) {
         let alive = true;
         const poll = async () => {
@@ -1840,7 +1849,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
         };
         tick(); return () => clearTimeout(timer);
       }
-    }, [jobId, uploadPending]);
+    }, [jobId, uploadPending, uploadError]);
     if (uploadPending) return (
       <Centered>
         <div style={{ textAlign: 'center' }}>
@@ -1848,6 +1857,16 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
           <div style={{ font: '400 11.5px/1.4 "IBM Plex Mono", monospace', color: 'var(--dim)', marginTop: 5 }}>sending to server, this may take a moment</div>
         </div>
         <Bar prog={0} />
+      </Centered>
+    );
+    if (uploadError) return (
+      <Centered>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ font: '600 16px/1.2 "IBM Plex Sans", sans-serif', color: 'var(--danger)' }}>Upload failed</div>
+          <div style={{ font: '400 11.5px/1.4 "IBM Plex Mono", monospace', color: 'var(--dim)', marginTop: 6 }}>{uploadError}</div>
+        </div>
+        <Bar prog={0} />
+        {onBack && <button onClick={onBack} style={{ font: '600 12px/1 "IBM Plex Sans", sans-serif', color: 'var(--accent)', background: 'transparent', border: '1px solid var(--accent)', borderRadius: 8, padding: '9px 16px', cursor: 'pointer', alignSelf: 'center' }}>← Back to upload</button>}
       </Centered>
     );
     return (
@@ -1871,7 +1890,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
           <div style={{ font: '400 10.5px/1 "IBM Plex Mono", monospace', color: 'var(--faint)', textAlign: 'center' }}>{currentStage}</div>
         )}
         <div style={{ textAlign: 'center', font: '600 12px/1 "IBM Plex Mono", monospace', color: 'var(--accent)' }}>
-          {prog >= 1 ? 'R² ' + data.overall.r2.toFixed(3) + ' · RMSE ' + data.overall.rmse.toFixed(4) : Math.round(prog * 100) + '%'}
+          {prog >= 1 ? 'Training complete' : Math.round(prog * 100) + '%'}
         </div>
       </Centered>
     );
@@ -2044,10 +2063,11 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
       setViewBatch(false); setCellId(id); setSelIdx(p => Math.min(p, c.nCycles - 1));
     };
     const [uploadPending, setUploadPending] = React.useState(false);
+    const [uploadError, setUploadError] = React.useState(null);
     const goTrain = () => setStage('uploadTrain');
     const startTrain = (ids, files, nomCap) => {
       const useIds = ids && ids.length ? ids : data.cellIds;
-      setTrainIds(useIds); setJobId(null);
+      setTrainIds(useIds); setJobId(null); setUploadError(null);
       if (files && files.length > 0) {
         setUploadPending(true);
         const fd = new FormData();
@@ -2057,8 +2077,12 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
           .then(r => r.json()).then(res => {
             setUploadPending(false);
             if (res.job_id) setJobId(res.job_id);
+            else setUploadError(res.error || 'Server returned no job ID — is it running?');
             if (res.cell_ids && res.cell_ids.length > 0) setTrainIds(res.cell_ids);
-          }).catch(() => setUploadPending(false));
+          }).catch(() => {
+            setUploadPending(false);
+            setUploadError('Could not reach the server — is it running on localhost:5000?');
+          });
       }
       setStage('training');
     };
@@ -2151,7 +2175,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
           <div style={{ flex: '1 1 auto', minHeight: 0 }}>
             {stage === 'landing'       && <LandingStage pal={pal} models={models} onTrainNew={goTrain} onUseModel={useModel} />}
             {stage === 'uploadTrain'   && <UploadTrainStage pal={pal} onBack={toLibrary} onTrain={startTrain} />}
-            {stage === 'training'      && <TrainingStage cellIds={trainIds} jobId={jobId} uploadPending={uploadPending} onDone={finishTrain} />}
+            {stage === 'training'      && <TrainingStage cellIds={trainIds} jobId={jobId} uploadPending={uploadPending} uploadError={uploadError} onDone={finishTrain} onBack={() => setStage('uploadTrain')} />}
             {stage === 'uploadPredict' && <UploadPredictStage pal={pal} model={activeModel} onBack={toLibrary} onPredict={runPredict} />}
             {stage === 'predicting'    && <PredictingStage cellId={cellId} predictPromise={predictPromiseRef.current} onDone={onPredictDone} />}
             {stage === 'report'        && <ReportStage cell={cell} selIdx={si} setIdx={setSelIdx} setCell={setCell} pal={pal} showBand={showBand} showGuide={showGuide} setGuide={setShowGuide} model={activeModel} scopeIds={scopeIds} mode={reportMode} batchCell={batchCell} />}
