@@ -403,12 +403,72 @@ NEW_STAGES = """\
     );
   }
 
+  const MECH_PLAIN = {
+    LLI: 'Lithium ions are being permanently consumed by SEI growth on the anode — the most common early-life degradation path.',
+    LAM: 'Active electrode material is being lost, reducing the number of sites available to store charge — capacity drops accelerate.',
+    RES: 'Internal resistance is increasing, broadening the dQ/dV peaks — often signals an approaching capacity knee.',
+    EARLY: 'Too early to assign a dominant mechanism — degradation signature is not yet distinguishable.',
+  };
+
+  function PredictionCallout({ cell, selIdx, model }) {
+    const data = window.SOHData;
+    const soh  = cell.sohPred[selIdx];
+    const cyc  = cell.cycles[selIdx];
+    const dom  = cell.rows[selIdx].phys.dominant;
+    const remaining = cell.rul != null ? Math.max(0, cell.rul - cyc) : null;
+    const isSynthetic = model && model.seed;
+    return (
+      <div style={{ background: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: 10, padding: '14px 18px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <span style={{ font: '600 11px/1 "IBM Plex Sans", sans-serif', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--faint)' }}>What this prediction means</span>
+          {isSynthetic && <span style={{ font: '500 9px/1 "IBM Plex Mono", monospace', color: 'var(--faint)', border: '1px solid var(--border)', borderRadius: 999, padding: '3px 8px' }}>synthetic demo data</span>}
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '10px 24px' }}>
+          <div>
+            <div style={{ font: '600 22px/1 "IBM Plex Mono", monospace', color: 'var(--accent)', fontVariantNumeric: 'tabular-nums' }}>{fmt.soh(soh)}</div>
+            <div style={{ font: '400 11.5px/1.5 "IBM Plex Sans", sans-serif', color: 'var(--dim)', marginTop: 5 }}>
+              State of health at cycle {fmt.cyc(cyc)}. The ElasticNet model estimates this cell has retained {fmt.soh(soh)} of its original capacity based on the shape of its dQ/dV curve.
+            </div>
+          </div>
+          <div>
+            {cell.rul != null ? (
+              <>
+                <div style={{ font: '600 22px/1 "IBM Plex Mono", monospace', color: remaining != null && remaining < 2000 ? 'var(--danger)' : 'var(--text)', fontVariantNumeric: 'tabular-nums' }}>
+                  {remaining != null && remaining > 0 ? fmt.cyc(remaining) + ' cycles left' : 'EOL reached'}
+                </div>
+                <div style={{ font: '400 11.5px/1.5 "IBM Plex Sans", sans-serif', color: 'var(--dim)', marginTop: 5 }}>
+                  Remaining useful life to 80% SOH. The dashed red line on the chart marks where end-of-life occurs (cycle {fmt.cyc(cell.rul)}).
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ font: '600 18px/1 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>EOL not reached</div>
+                <div style={{ font: '400 11.5px/1.5 "IBM Plex Sans", sans-serif', color: 'var(--dim)', marginTop: 5 }}>
+                  SOH stays above 80% across the full recorded window — end-of-life was not observed.
+                </div>
+              </>
+            )}
+          </div>
+          <div>
+            <div style={{ font: '600 14px/1.3 "IBM Plex Sans", sans-serif', color: dom === 'EARLY' ? 'var(--faint)' : 'var(--text)' }}>
+              {dom === 'EARLY' ? 'Indeterminate (early life)' : data.MECH[dom] ? data.MECH[dom].name : dom}
+            </div>
+            <div style={{ font: '400 11.5px/1.5 "IBM Plex Sans", sans-serif', color: 'var(--dim)', marginTop: 5 }}>
+              {MECH_PLAIN[dom] || ''}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function ReportStage({ cell, selIdx, setIdx, setCell, pal, showBand, showGuide, setGuide, model, scopeIds, mode, batchCell }) {
     const dominant = cell.rows[selIdx].phys.dominant, conf = cell.rows[selIdx].phys.conf;
     const titlePrefix = cell.isBatch ? 'Batch average' : cell.id;
     const MainCol = (
-      <div style={{ display: 'grid', gridTemplateRows: mode === 'single' ? 'auto auto 1fr auto auto' : 'auto 1fr auto auto', gap: 12, minHeight: 0 }}>
+      <div style={{ display: 'grid', gridTemplateRows: mode === 'single' ? 'auto auto auto 1fr auto auto' : 'auto auto 1fr auto auto', gap: 12, minHeight: 0 }}>
         {mode === 'single' && <SingleSummary cell={cell} model={model} selIdx={selIdx} pal={pal} />}
+        <PredictionCallout cell={cell} selIdx={selIdx} model={model} />
         <Explainer pal={pal} accent={pal.accent} collapsed={!showGuide} onToggle={() => setGuide(!showGuide)} />
         <Panel title={titlePrefix + ' · State of Health'} sub={cell.isBatch ? 'mean predicted trajectory' : 'predicted vs. measured'}
           right={<div style={{ display: 'flex', alignItems: 'center', gap: 14 }}><MechBadge dominant={dominant} confidence={conf} /><Scrubber cell={cell} selIdx={selIdx} onSelect={setIdx} pal={pal} /></div>}
