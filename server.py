@@ -513,33 +513,72 @@ def _build_batch(cells_json: dict) -> dict | None:
         "mae":  float(np.mean([c["metrics"]["mae"]  for c in cell_list])),
     }
 
+    # Interpolate each cell's per-cycle signals onto the shared grid, then average
+    sig_avg = {m: np.zeros(M) for m in ("LLI", "LAM", "RES")}
+    phys_avg = {"meanShiftV": np.zeros(M), "lamLoss": np.zeros(M), "resGrowth": np.zeros(M)}
+    n_contributing = np.zeros(M)
+
+    for cell in cell_list:
+        src = np.array(cell["cycles"], dtype=float)
+        for m in ("LLI", "LAM", "RES"):
+            cell_sig = np.array([r["signals"][m] for r in cell["rows"]], dtype=float)
+            sig_avg[m] += np.interp(tc, src, cell_sig)
+        for pk in phys_avg:
+            cell_phys = np.array([r["phys"][pk] for r in cell["rows"]], dtype=float)
+            phys_avg[pk] += np.interp(tc, src, cell_phys)
+        n_contributing += 1
+
+    for m in sig_avg:
+        sig_avg[m] = (sig_avg[m] / n_contributing).tolist()
+    for pk in phys_avg:
+        phys_avg[pk] = (phys_avg[pk] / n_contributing).tolist()
+
     rows = []
     for k in range(M):
         lf = k / (M - 1)
-        dominant = "LLI" if lf < 0.35 else ("LAM" if lf < 0.70 else "RES")
+        lli = float(sig_avg["LLI"][k])
+        lam = float(sig_avg["LAM"][k])
+        res = float(sig_avg["RES"][k])
+        tot = lli + lam + res + 1e-9
+        if tot < 0.05:
+            dominant = "EARLY"
+        elif lli >= lam and lli >= res:
+            dominant = "LLI"
+        elif lam >= res:
+            dominant = "LAM"
+        else:
+            dominant = "RES"
+        conf = min(0.97, max(lli, lam, res) / tot * 0.6 + 0.35)
+        mean_shift = float(phys_avg["meanShiftV"][k])
+        lam_loss   = float(phys_avg["lamLoss"][k])
+        res_growth = float(phys_avg["resGrowth"][k])
         rows.append({
             "cycle": cycles[k], "lifeFrac": lf,
             "ica": [], "dq": [], "feats": {},
-            "signals": {"LLI": 0.4 * lf, "LAM": 0.6 * lf, "RES": 0.8 * lf ** 1.8},
+            "signals": {"LLI": lli, "LAM": lam, "RES": res},
             "phys": {
-                "meanShiftV": 0.0, "lamLoss": 0.0, "resGrowth": 0.0,
-                "probs": {"LLI": 0.4, "LAM": 0.35, "RES": 0.25},
-                "dominant": dominant, "conf": 0.7, "tot": 0.5,
+                "meanShiftV": mean_shift, "lamLoss": lam_loss, "resGrowth": res_growth,
+                "probs": {"LLI": lli / tot, "LAM": lam / tot, "RES": res / tot},
+                "dominant": dominant, "conf": conf, "tot": tot,
             },
             "diag": [
-                {"label": "Phase transition 1", "voltage": 3.50, "shiftMv": 0.0, "widthMv": 45.0, "areaLossPct": 0.0},
-                {"label": "Phase transition 2", "voltage": 3.65, "shiftMv": 0.0, "widthMv": 38.0, "areaLossPct": 0.0},
-                {"label": "Phase transition 3", "voltage": 3.90, "shiftMv": 0.0, "widthMv": 55.0, "areaLossPct": 0.0},
+                {"label": "Phase transition 1", "voltage": 3.50, "shiftMv": mean_shift * 1000, "widthMv": 45.0, "areaLossPct": lam_loss * 100},
+                {"label": "Phase transition 2", "voltage": 3.65, "shiftMv": mean_shift * 1000, "widthMv": 38.0, "areaLossPct": lam_loss * 100},
+                {"label": "Phase transition 3", "voltage": 3.90, "shiftMv": mean_shift * 1000, "widthMv": 55.0, "areaLossPct": lam_loss * 100},
             ],
         })
 
     dom_seq = [r["phys"]["dominant"] for r in rows]
     phases  = _build_phases(dom_seq, cycles, soh_true_avg, M)
-    onsets  = {
-        "LLI": cycles[max(1, M // 12)],
-        "LAM": int(max_cyc * 0.30),
-        "RES": int(max_cyc * 0.65),
-    }
+
+    # Onsets: first batch-average cycle where each signal exceeds 0.16
+    onsets: dict[str, int | None] = {}
+    for m in ("LLI", "LAM", "RES"):
+        onsets[m] = next((cycles[k] for k, s in enumerate(sig_avg[m]) if s > 0.16), None)
+
+    cell_dominant = next(
+        (p["mech"] for p in reversed(phases) if p["mech"] != "EARLY"), "LLI"
+    )
 
     return {
         "id": "Batch average", "chemistry": "Custom", "form": "Uploaded",
@@ -549,7 +588,7 @@ def _build_batch(cells_json: dict) -> dict | None:
         "sohTrue": soh_true_avg, "sohPred": soh_pred_avg, "icaRef": [],
         "rows": rows, "metrics": avg_metrics, "rul": rul, "eol": 0.80,
         "sohLast": float(soh_true_avg[-1]),
-        "cellDominant": "RES", "phases": phases, "onsets": onsets,
+        "cellDominant": cell_dominant, "phases": phases, "onsets": onsets,
         "isBatch": True, "nCells": len(cell_list),
     }
 
