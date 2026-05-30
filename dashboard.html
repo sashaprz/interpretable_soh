@@ -1645,8 +1645,8 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
       <div style={{ height: '100%', overflow: 'auto' }}>
         <div style={{ width: 'min(820px, 100%)', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 15 }}>
           <BackLink onBack={onBack} label="Model library" crumb="Train new model" />
-          <input ref={fileRef} type="file" multiple accept=".csv" style={{ display: 'none' }} onChange={onFiles} />
-          <Dropzone title={hasReal ? files.length + ' file' + (files.length > 1 ? 's' : '') + ' selected' : 'Click to upload cycle CSVs'} sub={hasReal ? files.map(f => f.name).join(', ') : 'Oxford / Severson format · one file per cell'} onClick={() => fileRef.current && fileRef.current.click()} />
+          <input ref={fileRef} type="file" multiple accept=".csv,.mat" style={{ display: 'none' }} onChange={onFiles} />
+          <Dropzone title={hasReal ? files.length + ' file' + (files.length > 1 ? 's' : '') + ' selected' : 'Click to upload cycle data'} sub={hasReal ? files.map(f => f.name).join(', ') : 'Oxford .mat or per-cell CSVs (time, voltage, current)'} onClick={() => fileRef.current && fileRef.current.click()} />
           {hasReal && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 9, padding: '10px 14px' }}>
               <span style={{ font: '500 11.5px/1 "IBM Plex Sans", sans-serif', color: 'var(--dim)', flex: '0 0 auto' }}>Nominal capacity (Ah)</span>
@@ -1710,8 +1710,8 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
               <StatTile label="RMSE" value={model.rmse.toFixed(4)} />
             </div>
           )}
-          <input ref={fileRef} type="file" accept=".csv" style={{ display: 'none' }} onChange={onFile} />
-          <Dropzone title={file ? file.name : 'Click to upload a cell CSV to score'} sub={file ? (file.size / 1024).toFixed(0) + ' KB · click to change' : (model && !model.seed ? model.type + ' cell · same protocol as training' : 'Upload a real cell or pick a demo below')} onClick={() => fileRef.current && fileRef.current.click()} />
+          <input ref={fileRef} type="file" accept=".csv,.mat" style={{ display: 'none' }} onChange={onFile} />
+          <Dropzone title={file ? file.name : 'Click to upload a cell to score'} sub={file ? (file.size / 1024).toFixed(0) + ' KB · click to change' : (model && !model.seed ? 'Oxford .mat or cycle CSV · same chemistry as training' : 'Upload a real cell or pick a demo below')} onClick={() => fileRef.current && fileRef.current.click()} />
           {file && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 9, padding: '10px 14px' }}>
               <span style={{ font: '500 11.5px/1 "IBM Plex Sans", sans-serif', color: 'var(--dim)', flex: '0 0 auto' }}>Nominal capacity (Ah)</span>

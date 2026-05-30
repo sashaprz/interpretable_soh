@@ -36,6 +36,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
+from mat_converter import convert_oxford_mat, is_mat
 
 # ── lazy module loader (handles parenthesised filenames) ─────────────────────
 
@@ -114,7 +115,14 @@ def train():
             continue
         dest = save_dir / f.filename
         f.save(dest)
-        cell_specs.append(CellSpec(path=str(dest), nominal_capacity_ah=nominal_cap))
+        if is_mat(f.filename):
+            # Convert .mat → per-cell CSVs, one CellSpec per cell
+            csv_dir = save_dir / "converted"
+            csv_paths = convert_oxford_mat(dest, csv_dir)
+            for csv_path in csv_paths:
+                cell_specs.append(CellSpec(path=str(csv_path), nominal_capacity_ah=nominal_cap))
+        else:
+            cell_specs.append(CellSpec(path=str(dest), nominal_capacity_ah=nominal_cap))
 
     if not cell_specs:
         return jsonify({"error": "No valid files"}), 400
@@ -215,7 +223,16 @@ def predict():
     dest = tmp_dir / f.filename
     f.save(dest)
 
-    spec = CellSpec(path=str(dest), nominal_capacity_ah=nominal_cap)
+    if is_mat(f.filename):
+        csv_dir = tmp_dir / "converted"
+        csv_paths = convert_oxford_mat(dest, csv_dir)
+        if not csv_paths:
+            return jsonify({"error": "No cell data found in .mat file"}), 400
+        # Use the first cell from the .mat for prediction
+        spec = CellSpec(path=str(csv_paths[0]), nominal_capacity_ah=nominal_cap)
+    else:
+        spec = CellSpec(path=str(dest), nominal_capacity_ah=nominal_cap)
+
     pred_out = tmp_dir / "out"
     cfg = PipelineConfig(cells=[spec], output_dir=pred_out, stages=["parse", "ica", "features"])
     runner = PipelineRunner(cfg)
