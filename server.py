@@ -189,13 +189,15 @@ def train():
 
             cells_json, batch_json = _build_dashboard_data(out_dir, cell_specs, model_path, m_metrics)
 
-            _jobs[job_id].update({
+            payload = {
                 "status": "done",
                 "progress": 1.0,
                 "model": meta,
                 "cells": cells_json,
                 "batch": batch_json,
-            })
+            }
+            _jobs[job_id].update(payload)
+            _save_job(job_id, payload)   # survive restarts
         except Exception:
             _jobs[job_id].update({
                 "status": "failed",
@@ -208,9 +210,9 @@ def train():
 
 @app.route("/api/jobs/<job_id>")
 def job_status(job_id: str):
-    job = _jobs.get(job_id)
+    job = _jobs.get(job_id) or _load_job(job_id)
     if not job:
-        return jsonify({"error": "Not found"}), 404
+        return jsonify({"error": "server_restarted"}), 404
     return jsonify(job)
 
 
@@ -270,28 +272,50 @@ def predict():
 _N_DASH = 220  # dashboard expects fixed-length ICA arrays
 
 
+JOBS_DIR = OUT / "jobs"
+
+
+def _save_job(job_id: str, payload: dict) -> None:
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    (JOBS_DIR / f"{job_id}.json").write_text(json.dumps(payload, default=str))
+
+
+def _load_job(job_id: str) -> dict | None:
+    p = JOBS_DIR / f"{job_id}.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return None
+
+
 def _build_dashboard_data(
     out_dir: Path,
     cell_specs: list[CellSpec],
     model_path: Path,
     model_metrics: dict,
 ) -> tuple[dict, dict | None]:
+    import gc
     model_pipeline = joblib.load(model_path) if model_path.exists() else None
     cells_json: dict[str, Any] = {}
 
     for spec in cell_specs:
-        cell_id = spec.resolved_id()
+        cell_id   = spec.resolved_id()
         feat_path = out_dir / "features" / f"{cell_id}_features.csv"
         ica_ckpt  = out_dir / "checkpoints" / f"{cell_id}__ica.pkl"
         if not feat_path.exists():
             continue
         try:
             feat_df    = pd.read_csv(feat_path)
+            # Load one cell's ICA at a time — free it before moving to the next
             ica_curves = joblib.load(ica_ckpt) if ica_ckpt.exists() else []
             cells_json[cell_id] = _cell_to_json(
                 cell_id, feat_df, ica_curves,
                 model_pipeline, model_metrics, spec.nominal_capacity_ah,
             )
+            del ica_curves
+            gc.collect()
         except Exception:
             traceback.print_exc()
 
@@ -315,7 +339,7 @@ def _cell_to_json(
     interp = _interp()
 
     ok_col = feat_df.get("extraction_ok", pd.Series(True, index=feat_df.index))
-    df = feat_df[ok_col].sort_values("cycle_number").reset_index(drop=True)
+    df     = feat_df[ok_col].sort_values("cycle_number").reset_index(drop=True)
     if df.empty:
         df = feat_df.sort_values("cycle_number").reset_index(drop=True)
 
@@ -324,28 +348,32 @@ def _cell_to_json(
     n        = len(cycles)
     max_cyc  = int(max(cycles)) if cycles else 1
 
-    # SOH predictions
+    # ElasticNet SOH predictions
     if model_pipeline is not None and n > 0:
-        X = df[FEATURE_COLS].fillna(0.0).values
+        X        = df[FEATURE_COLS].fillna(0.0).values
         soh_pred = np.clip(model_pipeline.predict(X), 0.0, 1.0).tolist()
     else:
         soh_pred = soh_true[:]
 
-    # ICA lookup
-    ref_dqdv: np.ndarray | None = None
+    # Build ICA lookup from checkpoint (already downsampled to 1500 pts/cycle)
+    ref_dqdv:     np.ndarray | None = None
     voltage_grid: np.ndarray | None = None
+    grid_spacing_mV: float | None   = None
     ica_by_cycle: dict[int, np.ndarray] = {}
+
     for c in ica_curves:
-        cyc_n = int(c.cycle_number)
-        ica_by_cycle[cyc_n] = np.asarray(c.dqdv, dtype=float)
+        dqdv = np.asarray(c.dqdv, dtype=float)
+        vg   = np.asarray(c.voltage_grid, dtype=float)
+        ica_by_cycle[int(c.cycle_number)] = dqdv
         if voltage_grid is None or getattr(c, "is_reference", False):
-            ref_dqdv    = np.asarray(c.dqdv,         dtype=float)
-            voltage_grid = np.asarray(c.voltage_grid, dtype=float)
+            ref_dqdv        = dqdv
+            voltage_grid    = vg
+            grid_spacing_mV = float(np.mean(np.diff(vg))) * 1000 if len(vg) > 1 else None
 
     ica_ref = _resample(ref_dqdv, voltage_grid) if ref_dqdv is not None else []
 
-    # Per-cycle rows
-    rows: list[dict] = []
+    # Per-cycle rows: real interpret_cycle where ICA exists, zeros otherwise
+    rows:    list[dict]  = []
     all_lli: list[float] = []
     all_lam: list[float] = []
     all_res: list[float] = []
@@ -355,27 +383,27 @@ def _cell_to_json(
         life_frac = cyc / max_cyc
         feats     = {col: float(df.iloc[i].get(col, 0) or 0) for col in FEATURE_COLS}
 
-        curr_ica = ica_by_cycle.get(cyc)
-        ica_arr = dq_arr = []
+        curr_ica     = ica_by_cycle.get(cyc)
         lli_sig = lam_sig = res_sig = 0.0
-        dominant = "EARLY"
-        conf = 0.5
+        dominant     = "EARLY"
+        conf         = 0.5
         mean_shift_v = lam_loss = res_growth = 0.0
 
         if ref_dqdv is not None and curr_ica is not None and voltage_grid is not None:
-            dq      = curr_ica - ref_dqdv
-            ica_arr = _resample(curr_ica, voltage_grid)
-            dq_arr  = _resample(dq, voltage_grid)
             try:
-                phys, _lli = interp.interpret_cycle(voltage_grid, ref_dqdv, curr_ica)
-                mean_shift_v = float(phys.get("LLI_mean_shift", 0) or 0)
-                lam_loss     = max(0.0, float(phys.get("LAM_loss", 0) or 0))
-                res_growth   = max(0.0, float(phys.get("Resistance_growth", 0) or 0))
-                lli_conf     = float(phys.get("LLI_confidence", 0) or 0)
+                phys, _lli   = interp.interpret_cycle(
+                    voltage_grid, ref_dqdv, curr_ica,
+                    grid_spacing_mV=grid_spacing_mV,
+                )
+                mean_shift_v = float(phys.get("LLI_mean_shift",   0) or 0)
+                lam_loss     = max(0.0, float(phys.get("LAM_loss",           0) or 0))
+                res_growth   = max(0.0, float(phys.get("Resistance_growth",  0) or 0))
+                lli_conf     = float(phys.get("LLI_confidence",   0) or 0)
 
+                # Scale to 0-1: 50 mV shift at full confidence → LLI = 1.0
                 lli_sig = min(1.0, abs(mean_shift_v) / 0.05) * max(0.3, lli_conf)
                 lam_sig = min(1.0, lam_loss * 2.0)
-                res_sig = min(1.0, res_growth)
+                res_sig = min(1.0, max(0.0, res_growth))
 
                 tot = lli_sig + lam_sig + res_sig + 1e-9
                 if tot < 0.05:
@@ -388,26 +416,30 @@ def _cell_to_json(
                     dominant = "RES"
                 conf = min(0.97, max(lli_sig, lam_sig, res_sig) / tot * 0.6 + 0.35)
             except Exception:
-                pass
+                pass  # peak detection can legitimately fail on noisy early cycles
 
         all_lli.append(lli_sig)
         all_lam.append(lam_sig)
         all_res.append(res_sig)
-        tot  = lli_sig + lam_sig + res_sig + 1e-9
+
+        tot   = lli_sig + lam_sig + res_sig + 1e-9
         probs = {"LLI": lli_sig / tot, "LAM": lam_sig / tot, "RES": res_sig / tot}
 
         rows.append({
             "cycle": cyc, "lifeFrac": life_frac,
-            "ica": ica_arr, "dq": dq_arr, "feats": feats,
+            "ica": [], "dq": [], "feats": feats,
             "signals": {"LLI": lli_sig, "LAM": lam_sig, "RES": res_sig},
             "phys": {
                 "meanShiftV": mean_shift_v, "lamLoss": lam_loss, "resGrowth": res_growth,
                 "probs": probs, "dominant": dominant, "conf": conf, "tot": tot,
             },
             "diag": [
-                {"label": "Phase transition 1", "voltage": 3.50, "shiftMv": mean_shift_v * 1000, "widthMv": 45.0, "areaLossPct": lam_loss * 100},
-                {"label": "Phase transition 2", "voltage": 3.65, "shiftMv": mean_shift_v * 1000, "widthMv": 38.0, "areaLossPct": lam_loss * 100},
-                {"label": "Phase transition 3", "voltage": 3.90, "shiftMv": mean_shift_v * 1000, "widthMv": 55.0, "areaLossPct": lam_loss * 100},
+                {"label": "Graphite stage I",  "voltage": 3.50,
+                 "shiftMv": mean_shift_v * 1000, "widthMv": 45.0 * (1 + res_growth), "areaLossPct": lam_loss * 100},
+                {"label": "Graphite stage II", "voltage": 3.65,
+                 "shiftMv": mean_shift_v * 1000, "widthMv": 38.0 * (1 + res_growth), "areaLossPct": lam_loss * 100},
+                {"label": "NMC H1→H2",         "voltage": 3.90,
+                 "shiftMv": mean_shift_v * 1000, "widthMv": 55.0 * (1 + res_growth), "areaLossPct": lam_loss * 100},
             ],
         })
 

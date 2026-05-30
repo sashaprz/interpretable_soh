@@ -277,6 +277,10 @@ NEW_STAGES = """\
             const res = await fetch('/api/jobs/' + jobId);
             const d = await res.json();
             if (!alive) return;
+            if (!res.ok || d.error === 'server_restarted') {
+              setErrMsg('Server restarted mid-training — please try again'); return;
+            }
+            if (d.error) { setErrMsg(d.error); return; }
             const p = d.progress || 0;
             setProg(p);
             setFold(Math.min(cellIds.length, Math.floor(p * cellIds.length) + 1));
