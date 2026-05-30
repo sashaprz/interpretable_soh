@@ -128,17 +128,29 @@ def train():
         return jsonify({"error": "No valid files"}), 400
 
     cell_ids = [s.resolved_id() for s in cell_specs]
+    # parse + ica + features per cell, then one model stage
+    _total_steps = len(cell_specs) * 3 + 1
     _jobs[job_id] = {"status": "running", "progress": 0.0, "cell_ids": cell_ids}
+
+    class _TrackingRunner(PipelineRunner):
+        """Thin subclass that updates job progress after each stage completes."""
+        _completed = 0
+
+        def _timed(self, stage, cell_id, fn):
+            result, sr = super()._timed(stage, cell_id, fn)
+            if sr.status in ("ok", "skipped"):
+                _TrackingRunner._completed += 1
+                _jobs[job_id]["progress"] = min(0.93, _TrackingRunner._completed / _total_steps)
+            return result, sr
 
     def run() -> None:
         try:
             out_dir = OUT / "runs" / job_id
             cfg = PipelineConfig(cells=cell_specs, output_dir=out_dir)
-            runner = PipelineRunner(cfg)
+            runner = _TrackingRunner(cfg)
 
-            _jobs[job_id]["progress"] = 0.05
             result = runner.run()
-            _jobs[job_id]["progress"] = 0.85
+            _jobs[job_id]["progress"] = 0.95
 
             if result.overall_status == "failed":
                 errors = []
