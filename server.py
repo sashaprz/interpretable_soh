@@ -24,6 +24,7 @@ import json
 import sys
 import threading
 import traceback
+import os
 import uuid
 from pathlib import Path
 from typing import Any
@@ -132,7 +133,13 @@ def train():
             _jobs[job_id]["progress"] = 0.85
 
             if result.overall_status == "failed":
-                _jobs[job_id].update({"status": "failed", "error": "Pipeline failed — check pipeline.log"})
+                errors = []
+                for cid, cs in result.cell_summaries.items():
+                    for sr in cs.stage_results:
+                        if sr.status == "failed" and sr.error:
+                            errors.append(f"{cid} [{sr.stage}]: {sr.error}")
+                msg = " | ".join(errors) if errors else "Pipeline failed — check Render logs for traceback"
+                _jobs[job_id].update({"status": "failed", "error": msg})
                 return
 
             model_path = out_dir / "model" / "elasticnet_soh.joblib"
@@ -531,8 +538,9 @@ if __name__ == "__main__":
     print()
     print("  SOH Dashboard")
     print(f"  Local:   http://localhost:5000")
-    print(f"  Network: http://{local_ip}:5000  ← share this with teammates")
+    print(f"  Network: http://{local_ip}:5000  (share this with teammates)")
     print()
     print("  For internet access: ngrok http 5000")
     print()
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)

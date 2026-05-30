@@ -9,3 +9,5 @@ node_modules/
 *.h5
 data/
 checkpoints/
+pipeline_output/
+_feature_cache/
