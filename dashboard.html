@@ -1530,10 +1530,35 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
 (function () {
   function seedModels(data) {
     const all = data.cellIds;
+    // Add a truncated demo cell (Cell_01 cut at 30% of life) so users can
+    // click through the predict flow without uploading real data.
+    const base = data.byId['Cell_01'];
+    if (base && !data.byId['Cell_01_early']) {
+      const cut = Math.ceil(base.nCycles * 0.30);
+      const early = {
+        ...base,
+        id: 'Cell_01_early',
+        nCycles: cut,
+        cycles:  base.cycles.slice(0, cut),
+        sohTrue: base.sohTrue.slice(0, cut),
+        sohPred: base.sohPred.slice(0, cut),
+        rows:    base.rows.slice(0, cut),
+        maxCycle: base.cycles[cut - 1],
+        sohLast: base.sohTrue[cut - 1],
+        rul: null,  // unknown — not enough history yet
+      };
+      // Recompute phases on the truncated sequence
+      early.phases = base.phases.filter(p => p.startFrac < 0.30).map(p => ({
+        ...p, endCycle: Math.min(p.endCycle, early.maxCycle),
+        endFrac: Math.min(p.endFrac, 1),
+        sohEnd: early.sohTrue[Math.min(p.i1, cut - 1)],
+        i1: Math.min(p.i1, cut - 1),
+      }));
+      data.byId['Cell_01_early'] = early;
+      data.cellIds.push('Cell_01_early');
+    }
     return [
-      { id: 'm_nmc_v3', name: 'NMC-pouch · v3', typeKey: 'nmc', type: 'Graphite / NMC', form: 'Oxford pouch', cells: all.length, cellIds: all, r2: 0.987, rmse: 0.0094, mae: 0.0071, date: '2026-05-21', seed: true },
-      { id: 'm_nmc_v2', name: 'NMC-pouch · v2', typeKey: 'nmc', type: 'Graphite / NMC', form: 'Oxford pouch', cells: 5, cellIds: all.slice(0, 5), r2: 0.981, rmse: 0.0112, mae: 0.0085, date: '2026-04-08', seed: true },
-      { id: 'm_lfp_v1', name: 'LFP-cyl · baseline', typeKey: 'lfp', type: 'LFP / graphite', form: 'Severson cylindrical', cells: 8, cellIds: [], r2: 0.972, rmse: 0.0140, mae: 0.0102, date: '2026-03-02', seed: true, locked: true },
+      { id: 'm_nmc_v3', name: 'NMC-pouch · v3 (demo)', typeKey: 'nmc', type: 'Graphite / NMC', form: 'Oxford pouch', cells: all.length, cellIds: all, r2: 0.987, rmse: 0.0094, mae: 0.0071, date: '2026-05-21', seed: true },
     ];
   }
 
@@ -1775,13 +1800,14 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
   const P = () => window.SOHFlowParts;
   const L = () => window.SOHLanding;
 
-  function TrainingStage({ cellIds, jobId, onDone }) {
+  function TrainingStage({ cellIds, jobId, uploadPending, onDone }) {
     const data = window.SOHData;
     const [prog, setProg] = React.useState(0);
     const [fold, setFold] = React.useState(0);
     const [currentStage, setCurrentStage] = React.useState('');
     const [errMsg, setErrMsg] = React.useState(null);
     React.useEffect(() => {
+      if (uploadPending) return; // wait — fetch to /api/train hasn't resolved yet
       if (jobId) {
         let alive = true;
         const poll = async () => {
@@ -1790,7 +1816,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
             const d = await res.json();
             if (!alive) return;
             if (!res.ok || d.error === 'server_restarted') {
-              setErrMsg('Server restarted mid-training — please try again'); return;
+              setErrMsg('Server restarted — please try again'); return;
             }
             if (d.error) { setErrMsg(d.error); return; }
             const p = d.progress || 0;
@@ -1805,6 +1831,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
         poll();
         return () => { alive = false; };
       } else {
+        // Demo mode only — no real files uploaded
         const total = 2200, t0 = performance.now(); let timer;
         const tick = () => {
           const p = Math.min(1, (performance.now() - t0) / total);
@@ -1813,7 +1840,16 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
         };
         tick(); return () => clearTimeout(timer);
       }
-    }, [jobId]);
+    }, [jobId, uploadPending]);
+    if (uploadPending) return (
+      <Centered>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ font: '600 16px/1.2 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>Uploading files…</div>
+          <div style={{ font: '400 11.5px/1.4 "IBM Plex Mono", monospace', color: 'var(--dim)', marginTop: 5 }}>sending to server, this may take a moment</div>
+        </div>
+        <Bar prog={0} />
+      </Centered>
+    );
     return (
       <Centered>
         <div style={{ textAlign: 'center' }}>
@@ -1947,19 +1983,22 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
       const c = data.byId[id]; if (!c) return;
       setViewBatch(false); setCellId(id); setSelIdx(p => Math.min(p, c.nCycles - 1));
     };
+    const [uploadPending, setUploadPending] = React.useState(false);
     const goTrain = () => setStage('uploadTrain');
     const startTrain = (ids, files, nomCap) => {
       const useIds = ids && ids.length ? ids : data.cellIds;
       setTrainIds(useIds); setJobId(null);
       if (files && files.length > 0) {
+        setUploadPending(true);
         const fd = new FormData();
         for (const f of files) fd.append('files', f);
         fd.append('nominal_capacity_ah', String(nomCap || 5.0));
         fetch('/api/train', { method: 'POST', body: fd })
           .then(r => r.json()).then(res => {
+            setUploadPending(false);
             if (res.job_id) setJobId(res.job_id);
             if (res.cell_ids && res.cell_ids.length > 0) setTrainIds(res.cell_ids);
-          }).catch(() => {});
+          }).catch(() => setUploadPending(false));
       }
       setStage('training');
     };
@@ -2052,7 +2091,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
           <div style={{ flex: '1 1 auto', minHeight: 0 }}>
             {stage === 'landing'       && <LandingStage pal={pal} models={models} onTrainNew={goTrain} onUseModel={useModel} />}
             {stage === 'uploadTrain'   && <UploadTrainStage pal={pal} onBack={toLibrary} onTrain={startTrain} />}
-            {stage === 'training'      && <TrainingStage cellIds={trainIds} jobId={jobId} onDone={finishTrain} />}
+            {stage === 'training'      && <TrainingStage cellIds={trainIds} jobId={jobId} uploadPending={uploadPending} onDone={finishTrain} />}
             {stage === 'uploadPredict' && <UploadPredictStage pal={pal} model={activeModel} onBack={toLibrary} onPredict={runPredict} />}
             {stage === 'predicting'    && <PredictingStage cellId={cellId} predictPromise={predictPromiseRef.current} onDone={onPredictDone} />}
             {stage === 'report'        && <ReportStage cell={cell} selIdx={si} setIdx={setSelIdx} setCell={setCell} pal={pal} showBand={showBand} showGuide={showGuide} setGuide={setShowGuide} model={activeModel} scopeIds={scopeIds} mode={reportMode} batchCell={batchCell} />}
