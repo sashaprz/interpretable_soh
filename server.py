@@ -317,6 +317,9 @@ def _build_dashboard_data(
     model_metrics: dict,
 ) -> tuple[dict, dict | None]:
     import gc
+    # step2 ICACurve objects are pickled under the module name "_step2".
+    # Register it in sys.modules so joblib can unpickle ICA checkpoints.
+    _load("_step2", "step2_Q(v)_extraction.py")
     model_pipeline = joblib.load(model_path) if model_path.exists() else None
     cells_json: dict[str, Any] = {}
 
@@ -384,7 +387,9 @@ def _cell_to_json(
     for c in ica_curves:
         dqdv = np.asarray(c.dqdv, dtype=float)
         vg   = np.asarray(c.voltage_grid, dtype=float)
-        ica_by_cycle[int(c.cycle_number)] = dqdv
+        # step2.ICACurve uses cycle_index; ica_curve_adapter.ICACurve uses cycle_number
+        cyc_key = int(getattr(c, "cycle_number", None) or getattr(c, "cycle_index", 0))
+        ica_by_cycle[cyc_key] = dqdv
         if voltage_grid is None or getattr(c, "is_reference", False):
             ref_dqdv        = dqdv
             voltage_grid    = vg

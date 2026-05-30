@@ -68,8 +68,10 @@ class FeatureConfig:
     # Outlier clipping applied to delta Q(V) before feature extraction
     outlier_sigma: float = 5.0
 
-    # Flag cycle unusable if > this fraction of grid points are NaN
-    max_nan_fraction: float = 0.10
+    # Flag cycle unusable if > this fraction of grid points are NaN.
+    # 0.20 accommodates cells whose voltage range doesn't reach the grid
+    # extremes (e.g. discharge cutoff at 2.7 V on a 2.5–4.2 V grid ≈ 12%).
+    max_nan_fraction: float = 0.20
 
     # Remove first/last N grid points after SG filter (eliminates ringing)
     edge_trim_pts: int = 5

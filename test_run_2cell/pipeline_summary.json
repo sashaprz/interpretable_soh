@@ -1,0 +1,84 @@
+{
+  "overall_status": "ok",
+  "model_metrics": {
+    "rmse": 0.4868297360253792,
+    "mae": 0.06481260578918835,
+    "r2": -51.096314532217114
+  },
+  "cells": {
+    "cell1_cycle": {
+      "n_cycles_parsed": 78,
+      "n_ica_curves": 1,
+      "n_features_ok": 78,
+      "per_cell_metrics": {
+        "rmse": 0.6772927585164112,
+        "mae": 0.11792474220442578,
+        "r2": -101.22224096816669
+      },
+      "flagged_cycles": {},
+      "stages": [
+        {
+          "stage": "parse",
+          "status": "ok",
+          "elapsed_s": 0.631,
+          "resumed": false,
+          "error": null,
+          "artifact": "test_run_2cell\\checkpoints\\cell1_cycle__parse.pkl"
+        },
+        {
+          "stage": "ica",
+          "status": "ok",
+          "elapsed_s": 1.575,
+          "resumed": false,
+          "error": null,
+          "artifact": "test_run_2cell\\checkpoints\\cell1_cycle__ica.pkl"
+        },
+        {
+          "stage": "features",
+          "status": "ok",
+          "elapsed_s": 0.601,
+          "resumed": false,
+          "error": null,
+          "artifact": "test_run_2cell\\checkpoints\\cell1_cycle__features.pkl"
+        }
+      ]
+    },
+    "cell2_cycle": {
+      "n_cycles_parsed": 73,
+      "n_ica_curves": 1,
+      "n_features_ok": 73,
+      "per_cell_metrics": {
+        "rmse": 0.009718275423117486,
+        "mae": 0.008062651811263415,
+        "r2": 0.979536478228323
+      },
+      "flagged_cycles": {},
+      "stages": [
+        {
+          "stage": "parse",
+          "status": "ok",
+          "elapsed_s": 0.643,
+          "resumed": false,
+          "error": null,
+          "artifact": "test_run_2cell\\checkpoints\\cell2_cycle__parse.pkl"
+        },
+        {
+          "stage": "ica",
+          "status": "ok",
+          "elapsed_s": 0.206,
+          "resumed": false,
+          "error": null,
+          "artifact": "test_run_2cell\\checkpoints\\cell2_cycle__ica.pkl"
+        },
+        {
+          "stage": "features",
+          "status": "ok",
+          "elapsed_s": 0.383,
+          "resumed": false,
+          "error": null,
+          "artifact": "test_run_2cell\\checkpoints\\cell2_cycle__features.pkl"
+        }
+      ]
+    }
+  }
+}

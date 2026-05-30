@@ -18,6 +18,7 @@ from typing import Iterator
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import ElasticNet
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.pipeline import Pipeline
@@ -102,6 +103,7 @@ class SOHModelTrainer:
 
     def _build_pipeline(self) -> Pipeline:
         return Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
             ("scaler", StandardScaler()),
             ("enet", ElasticNet(
                 alpha=self.alpha,

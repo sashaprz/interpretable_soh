@@ -57,6 +57,7 @@ def _cell_keys(mat_path: str | Path) -> list[str]:
 def _convert_cell(cell_data: dict) -> list[dict]:
     """Extract rows from one cell's data dict."""
     rows: list[dict] = []
+    t_offset: float = 0.0  # cumulative offset keeps global time strictly increasing
 
     for cyc_key in sorted(cell_data.keys()):
         if not cyc_key.startswith("cyc"):
@@ -91,7 +92,14 @@ def _convert_cell(cell_data: dict) -> list[dict]:
             idx = np.round(np.linspace(0, len(t) - 1, MAX_POINTS_PER_CYCLE)).astype(int)
             t, v, q, T = t[idx], v[idx], q[idx], T[idx]
 
-        t_s = (t - t[0]) * 86_400.0
+        # Build globally-increasing time: each cycle starts 1 s after the
+        # previous ends.  The parser sorts by time, so per-cycle relative time
+        # (which resets to 0) would interleave cycles; a few Oxford snapshots
+        # also have backwards absolute timestamps, so absolute dates can't be
+        # used either.
+        t_rel = (t - t[0]) * 86_400.0          # seconds, relative to this cycle
+        t_s   = t_rel + t_offset
+        t_offset = t_s[-1] + 1.0               # next cycle starts 1 s later
 
         dt_h = np.gradient(t) * 24.0
         dq   = np.gradient(q)

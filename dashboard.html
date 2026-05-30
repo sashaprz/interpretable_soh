@@ -2106,7 +2106,11 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
         const bc = jobData.batch;
         if (bc) { bc.nCells = realIds.length; setBatchCell(bc); }
         setViewBatch(!!bc); setReportMode(bc ? 'batch' : 'single');
-        if (realIds[0] && data.byId[realIds[0]]) { setCellId(realIds[0]); setSelIdx(0); }
+        if (realIds[0] && data.byId[realIds[0]]) {
+          setCellId(realIds[0]);
+          const nCyc = bc ? bc.nCycles : data.byId[realIds[0]].nCycles;
+          setSelIdx(Math.round(nCyc * 0.8));
+        }
       } else {
         const ids = trainIds;
         const nextV = Math.max(3, ...models.filter(m => m.typeKey === 'nmc').map(m => +(m.name.match(/v(\d+)/) || [0, 0])[1])) + 1;

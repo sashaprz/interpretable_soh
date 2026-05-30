@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0",
+  "feature_cols": [
+    "dqv_variance",
+    "dqv_log_variance",
+    "dqv_skewness",
+    "dqv_kurtosis",
+    "dqv_integral_abs",
+    "dqv_max_deviation",
+    "dqv_min",
+    "dqv_max",
+    "dqv_mean",
+    "dqv_rms"
+  ],
+  "metadata_cols": [
+    "cell_id",
+    "cycle_number",
+    "soh",
+    "temperature",
+    "protocol",
+    "ref_cycle_index",
+    "config_hash",
+    "extraction_ok"
+  ],
+  "column_aliases": {
+    "log_var_deltaQ": "dqv_log_variance",
+    "var_deltaQ": "dqv_variance",
+    "skew_deltaQ": "dqv_skewness",
+    "kurtosis_deltaQ": "dqv_kurtosis",
+    "abs_integral_deltaQ": "dqv_integral_abs",
+    "max_dev_deltaQ": "dqv_max_deviation",
+    "cycle_index": "cycle_number"
+  }
+}
