@@ -80,7 +80,7 @@ def _convert_cell(cell_data: dict) -> list[dict]:
 
         t = np.asarray(hc["t"], dtype=float)
         v = np.asarray(hc["v"], dtype=float)
-        q = np.asarray(hc["q"], dtype=float)
+        q = np.asarray(hc["q"], dtype=float) / 1000.0   # Oxford stores q in mAh; convert to Ah
         T = np.asarray(hc["T"], dtype=float)
 
         if len(t) < 10:
