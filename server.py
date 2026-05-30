@@ -133,10 +133,13 @@ def train():
     _jobs[job_id] = {"status": "running", "progress": 0.0, "cell_ids": cell_ids}
 
     class _TrackingRunner(PipelineRunner):
-        """Thin subclass that updates job progress after each stage completes."""
         _completed = 0
 
         def _timed(self, stage, cell_id, fn):
+            # Mark stage as started — bar advances halfway to next milestone immediately
+            half = min(0.93, (_TrackingRunner._completed + 0.4) / _total_steps)
+            _jobs[job_id]["progress"] = half
+            _jobs[job_id]["current_stage"] = f"{stage} · {cell_id}"
             result, sr = super()._timed(stage, cell_id, fn)
             if sr.status in ("ok", "skipped"):
                 _TrackingRunner._completed += 1

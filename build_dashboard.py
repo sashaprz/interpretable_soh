@@ -267,6 +267,7 @@ NEW_STAGES = """\
     const data = window.SOHData;
     const [prog, setProg] = React.useState(0);
     const [fold, setFold] = React.useState(0);
+    const [currentStage, setCurrentStage] = React.useState('');
     const [errMsg, setErrMsg] = React.useState(null);
     React.useEffect(() => {
       if (jobId) {
@@ -279,6 +280,7 @@ NEW_STAGES = """\
             const p = d.progress || 0;
             setProg(p);
             setFold(Math.min(cellIds.length, Math.floor(p * cellIds.length) + 1));
+            if (d.current_stage) setCurrentStage(d.current_stage);
             if (d.status === 'done') { setTimeout(() => onDone(d), 400); return; }
             if (d.status === 'failed') { setErrMsg(d.error || 'Pipeline failed'); return; }
             setTimeout(poll, 700);
@@ -313,6 +315,9 @@ NEW_STAGES = """\
             );
           })}
         </div>
+        {currentStage && prog < 1 && (
+          <div style={{ font: '400 10.5px/1 "IBM Plex Mono", monospace', color: 'var(--faint)', textAlign: 'center' }}>{currentStage}</div>
+        )}
         <div style={{ textAlign: 'center', font: '600 12px/1 "IBM Plex Mono", monospace', color: 'var(--accent)' }}>
           {prog >= 1 ? 'R² ' + data.overall.r2.toFixed(3) + ' · RMSE ' + data.overall.rmse.toFixed(4) : Math.round(prog * 100) + '%'}
         </div>
@@ -435,7 +440,10 @@ NEW_STAGES = """\
         for (const f of files) fd.append('files', f);
         fd.append('nominal_capacity_ah', String(nomCap || 5.0));
         fetch('/api/train', { method: 'POST', body: fd })
-          .then(r => r.json()).then(res => { if (res.job_id) setJobId(res.job_id); }).catch(() => {});
+          .then(r => r.json()).then(res => {
+            if (res.job_id) setJobId(res.job_id);
+            if (res.cell_ids && res.cell_ids.length > 0) setTrainIds(res.cell_ids);
+          }).catch(() => {});
       }
       setStage('training');
     };
