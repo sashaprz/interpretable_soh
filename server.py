@@ -109,43 +109,65 @@ def train():
     save_dir = UPLOAD_DIR / job_id
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    cell_specs: list[CellSpec] = []
+    # Save uploaded bytes to disk — fast, no parsing yet
+    saved: list[tuple[Path, str]] = []
     for f in files:
         if not f.filename:
             continue
         dest = save_dir / f.filename
         f.save(dest)
-        if is_mat(f.filename):
-            # Convert .mat → per-cell CSVs, one CellSpec per cell
-            csv_dir = save_dir / "converted"
-            csv_paths = convert_oxford_mat(dest, csv_dir)
-            for csv_path in csv_paths:
-                cell_specs.append(CellSpec(path=str(csv_path), nominal_capacity_ah=nominal_cap))
-        else:
-            cell_specs.append(CellSpec(path=str(dest), nominal_capacity_ah=nominal_cap))
+        saved.append((dest, f.filename))
 
-    if not cell_specs:
+    if not saved:
         return jsonify({"error": "No valid files"}), 400
 
-    cell_ids = [s.resolved_id() for s in cell_specs]
-    # parse + ica + features per cell, then one model stage
-    _total_steps = len(cell_specs) * 3 + 1
-    _jobs[job_id] = {"status": "running", "progress": 0.0, "cell_ids": cell_ids}
-
-    class _TrackingRunner(PipelineRunner):
-        _completed = 0
-
-        def _timed(self, stage, cell_id, fn):
-            # Show stage starting — advance bar to start of this step
-            _jobs[job_id]["progress"] = (_TrackingRunner._completed + 0.3) / _total_steps * 0.90
-            _jobs[job_id]["current_stage"] = f"{stage} · {cell_id}"
-            result, sr = super()._timed(stage, cell_id, fn)
-            if sr.status in ("ok", "skipped"):
-                _TrackingRunner._completed += 1
-                _jobs[job_id]["progress"] = _TrackingRunner._completed / _total_steps * 0.90
-            return result, sr
+    # Return the job_id immediately; all heavy work (including .mat conversion)
+    # runs in the background thread below.
+    _jobs[job_id] = {"status": "running", "progress": 0.0, "cell_ids": [], "current_stage": "preparing"}
 
     def run() -> None:
+        try:
+            # ── resolve cell specs (mat conversion happens here, off the request thread) ──
+            cell_specs: list[CellSpec] = []
+            for dest, filename in saved:
+                if is_mat(filename):
+                    _jobs[job_id]["current_stage"] = f"converting · {filename}"
+                    csv_dir = save_dir / "converted"
+                    csv_paths = convert_oxford_mat(dest, csv_dir)
+                    for csv_path in csv_paths:
+                        cell_specs.append(CellSpec(path=str(csv_path), nominal_capacity_ah=nominal_cap))
+                else:
+                    cell_specs.append(CellSpec(path=str(dest), nominal_capacity_ah=nominal_cap))
+
+            if not cell_specs:
+                _jobs[job_id].update({"status": "failed", "error": "No valid cell data found in uploaded files"})
+                return
+
+            cell_ids = [s.resolved_id() for s in cell_specs]
+            _total_steps = len(cell_specs) * 3 + 1
+            _jobs[job_id]["cell_ids"] = cell_ids
+            _jobs[job_id]["progress"] = 0.02
+            _jobs[job_id]["current_stage"] = "starting pipeline"
+
+        except Exception:
+            _jobs[job_id].update({
+                "status": "failed",
+                "error": traceback.format_exc().strip().splitlines()[-1],
+            })
+            return
+
+        class _TrackingRunner(PipelineRunner):
+            _completed = 0
+
+            def _timed(self, stage, cell_id, fn):
+                _jobs[job_id]["progress"] = (_TrackingRunner._completed + 0.3) / _total_steps * 0.90
+                _jobs[job_id]["current_stage"] = f"{stage} · {cell_id}"
+                result, sr = super()._timed(stage, cell_id, fn)
+                if sr.status in ("ok", "skipped"):
+                    _TrackingRunner._completed += 1
+                    _jobs[job_id]["progress"] = _TrackingRunner._completed / _total_steps * 0.90
+                return result, sr
+
         try:
             out_dir = OUT / "runs" / job_id
             cfg = PipelineConfig(cells=cell_specs, output_dir=out_dir)
@@ -167,7 +189,6 @@ def train():
             model_path = out_dir / "model" / "elasticnet_soh.joblib"
             m_metrics = result.model_metrics or {}
 
-            # persist model metadata
             model_id = f"m_{job_id}"
             meta: dict[str, Any] = {
                 "id": model_id,
@@ -196,7 +217,7 @@ def train():
                 "batch": batch_json,
             }
             _jobs[job_id].update(payload)
-            _save_job(job_id, payload)   # survive restarts
+            _save_job(job_id, payload)
         except Exception:
             _jobs[job_id].update({
                 "status": "failed",
@@ -204,7 +225,7 @@ def train():
             })
 
     threading.Thread(target=run, daemon=True).start()
-    return jsonify({"job_id": job_id, "status": "running", "cell_ids": cell_ids})
+    return jsonify({"job_id": job_id, "status": "running", "cell_ids": []})
 
 
 @app.route("/api/jobs/<job_id>")

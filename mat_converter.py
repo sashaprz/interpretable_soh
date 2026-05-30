@@ -48,8 +48,10 @@ MAX_POINTS_PER_CYCLE = 1_500
 
 def _cell_keys(mat_path: str | Path) -> list[str]:
     """Return sorted Cell* key names without loading cell data."""
-    info = scipy.io.loadmat(str(mat_path), variable_names=[])
-    return sorted(k for k in info if k.startswith("Cell"))
+    return sorted(
+        name for name, _shape, _dtype in scipy.io.whosmat(str(mat_path))
+        if name.startswith("Cell")
+    )
 
 
 def _convert_cell(cell_data: dict) -> list[dict]:

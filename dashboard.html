@@ -1814,6 +1814,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
     const [fold, setFold] = React.useState(0);
     const [currentStage, setCurrentStage] = React.useState('');
     const [errMsg, setErrMsg] = React.useState(null);
+    const [liveIds, setLiveIds] = React.useState(cellIds);
     React.useEffect(() => {
       if (uploadPending) return; // wait — fetch to /api/train hasn't resolved yet
       if (uploadError) return;   // upload failed — don't start animation
@@ -1830,7 +1831,9 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
             if (d.error) { setErrMsg(d.error); return; }
             const p = d.progress || 0;
             setProg(p);
-            setFold(Math.min(cellIds.length, Math.floor(p * cellIds.length) + 1));
+            const activeIds = (d.cell_ids && d.cell_ids.length > 0) ? d.cell_ids : cellIds;
+            if (d.cell_ids && d.cell_ids.length > 0) setLiveIds(d.cell_ids);
+            setFold(Math.min(activeIds.length, Math.floor(p * activeIds.length) + 1));
             if (d.current_stage) setCurrentStage(d.current_stage);
             if (d.status === 'done') { setTimeout(() => onDone(d), 400); return; }
             if (d.status === 'failed') { setErrMsg(d.error || 'Pipeline failed'); return; }
@@ -1872,12 +1875,16 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
     return (
       <Centered>
         <div style={{ textAlign: 'center' }}>
-          <div style={{ font: '600 16px/1.2 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>Training SOH model</div>
-          <div style={{ font: '400 11.5px/1.4 "IBM Plex Mono", monospace', color: 'var(--dim)', marginTop: 5 }}>ElasticNet · leave-one-cell-out cross-validation</div>
+          <div style={{ font: '600 16px/1.2 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>
+            {currentStage.startsWith('converting') ? 'Converting data format…' : 'Training SOH model'}
+          </div>
+          <div style={{ font: '400 11.5px/1.4 "IBM Plex Mono", monospace', color: 'var(--dim)', marginTop: 5 }}>
+            {currentStage.startsWith('converting') ? 'reading .mat file and extracting cell cycles' : 'ElasticNet \xb7 leave-one-cell-out cross-validation'}
+          </div>
         </div>
         {errMsg ? <div style={{ font: '400 12px/1.5 "IBM Plex Mono", monospace', color: 'var(--danger)', textAlign: 'center', padding: '0 20px' }}>Error: {errMsg}</div> : <Bar prog={prog} />}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-          {cellIds.map((id, i) => {
+          {liveIds.map((id, i) => {
             const st = prog >= 1 || i < fold - 1 ? 'done' : i === fold - 1 ? 'run' : 'wait';
             return (
               <div key={id} style={{ display: 'flex', alignItems: 'center', gap: 10, font: '400 11.5px/1 "IBM Plex Mono", monospace', color: st === 'wait' ? 'var(--faint)' : 'var(--dim)' }}>
@@ -1886,7 +1893,7 @@ window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail
             );
           })}
         </div>
-        {currentStage && prog < 1 && (
+        {currentStage && !currentStage.startsWith('converting') && prog < 1 && (
           <div style={{ font: '400 10.5px/1 "IBM Plex Mono", monospace', color: 'var(--faint)', textAlign: 'center' }}>{currentStage}</div>
         )}
         <div style={{ textAlign: 'center', font: '600 12px/1 "IBM Plex Mono", monospace', color: 'var(--accent)' }}>
