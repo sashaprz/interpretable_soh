@@ -1,0 +1,2091 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interpretable SOH · Batch Flow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #0b0c0f; }
+  body { font-family: "IBM Plex Sans", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  #root { height: 100vh; }
+  input[type="range"] { -webkit-appearance: none; appearance: none; background: transparent; height: 14px; }
+  input[type="range"]::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: var(--track, rgba(255,255,255,.12)); }
+  input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 13px; height: 13px; border-radius: 50%; background: var(--accent, #28c4b2); margin-top: -4.5px; cursor: pointer; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent,#28c4b2) 22%, transparent); }
+  input[type="range"]::-moz-range-track { height: 4px; border-radius: 2px; background: var(--track, rgba(255,255,255,.12)); }
+  input[type="range"]::-moz-range-thumb { width: 13px; height: 13px; border: none; border-radius: 50%; background: var(--accent, #28c4b2); cursor: pointer; }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.14); border-radius: 5px; }
+  #loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; color: #28c4b2; font: 500 13px/1 "IBM Plex Mono", monospace; letter-spacing: .1em; }
+</style>
+</head>
+<body>
+<div id="loading">LOADING…</div>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/javascript">
+/* soh-data.js — deterministic mock dataset for the Interpretable SOH batch flow.
+ * Models the Oxford Battery Degradation Dataset (graphite/NMC pouch cells) and
+ * the sashaprz/interpretable_soh pipeline contract:
+ *   dQ/dV ICA → ΔQ(V) features → ElasticNet SOH (LOCO CV) → physics interpretation.
+ *
+ * Mechanisms are LIFE-STAGED so each emerges at a different point in cycle life:
+ *   LLI  (lithium inventory loss)  — saturating, strongest EARLY  (SEI growth)
+ *   LAM  (loss of active material) — sigmoid, emerges MID-life
+ *   R↑   (resistance growth)       — accelerating, dominates LATE  (knee)
+ * This makes "where each mechanism occurs" a real, segmentable story.
+ * Exposes window.SOHData. Seeded → stable across reloads.
+ */
+(function () {
+  'use strict';
+
+  function rng(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const gauss = (x, mu, s, amp) => amp * Math.exp(-0.5 * ((x - mu) / s) ** 2);
+
+  // life-fraction mechanism kernels — tuned so dominance HANDS OFF over life:
+  //   LLI saturates early to a plateau < 1 (peak shift happens then stabilises),
+  //   LAM emerges mid-life (sigmoid), R↑ accelerates late and can overtake both.
+  const kLLI = (f) => 0.58 * (1 - Math.exp(-f / 0.09));
+  const kLAM = (f) => 0.92 / (1 + Math.exp(-(f - 0.46) / 0.085));
+  const kRES = (f) => Math.pow(f, 1.9);
+
+  const V_MIN = 3.0, V_MAX = 4.2, N_V = 220;
+  const VOLT = Array.from({ length: N_V }, (_, i) => V_MIN + (V_MAX - V_MIN) * i / (N_V - 1));
+  const GRID_MV = (VOLT[1] - VOLT[0]) * 1000;
+
+  const BASE_PEAKS = [
+    { mu: 3.49, sigma: 0.045, amp: 4.2 },
+    { mu: 3.63, sigma: 0.038, amp: 6.1 },
+    { mu: 3.91, sigma: 0.055, amp: 3.4 },
+  ];
+
+  // per-cell mechanism personality weights — chosen to give a varied population
+  // (some progress through all three pathways, others are LAM- or R↑-led).
+  const CELLS_SPEC = [
+    { id: 'Cell_01', maxCycle: 8000, eol: 0.802, lli: 1.00, lam: 1.00, res: 1.08, temp: 40, seed: 11 }, // showcase: LLI→LAM→R↑
+    { id: 'Cell_02', maxCycle: 7600, eol: 0.812, lli: 1.00, lam: 1.18, res: 0.70, temp: 40, seed: 23 }, // LAM-led
+    { id: 'Cell_03', maxCycle: 5400, eol: 0.806, lli: 0.90, lam: 0.85, res: 1.35, temp: 50, seed: 37 }, // early R↑ knee
+    { id: 'Cell_04', maxCycle: 6800, eol: 0.809, lli: 1.00, lam: 1.00, res: 1.00, temp: 45, seed: 41 }, // balanced
+    { id: 'Cell_05', maxCycle: 7200, eol: 0.815, lli: 1.15, lam: 0.78, res: 0.60, temp: 40, seed: 53 }, // LLI-led
+    { id: 'Cell_06', maxCycle: 5800, eol: 0.804, lli: 0.85, lam: 1.00, res: 1.22, temp: 50, seed: 67 }, // LLI→LAM→R↑
+  ];
+
+  function moments(arr) {
+    const n = arr.length;
+    let mean = 0; for (const v of arr) mean += v; mean /= n;
+    let m2 = 0, m3 = 0, m4 = 0, sumabs = 0, ss = 0, mn = Infinity, mx = -Infinity, maxdev = 0;
+    for (const v of arr) {
+      const d = v - mean; m2 += d * d; m3 += d ** 3; m4 += d ** 4;
+      sumabs += Math.abs(v); ss += v * v;
+      if (v < mn) mn = v; if (v > mx) mx = v;
+      if (Math.abs(v) > maxdev) maxdev = Math.abs(v);
+    }
+    const variance = m2 / n, sd = Math.sqrt(variance) || 1e-9;
+    return {
+      dqv_variance: variance, dqv_log_variance: Math.log(variance + 1e-12),
+      dqv_skewness: (m3 / n) / sd ** 3, dqv_kurtosis: (m4 / n) / variance ** 2 - 3,
+      dqv_integral_abs: sumabs * (VOLT[1] - VOLT[0]), dqv_max_deviation: maxdev,
+      dqv_min: mn, dqv_max: mx, dqv_mean: mean, dqv_rms: Math.sqrt(ss / n),
+    };
+  }
+  function simpson(y) {
+    const h = VOLT[1] - VOLT[0];
+    let s = y[0] + y[y.length - 1];
+    for (let i = 1; i < y.length - 1; i++) s += (i % 2 ? 4 : 2) * y[i];
+    return s * h / 3;
+  }
+
+  const MECH_ORDER = ['LLI', 'LAM', 'RES'];
+  const MECH = {
+    LLI: { key: 'LLI', name: 'Lithium inventory loss', short: 'LLI', cssVar: '--mech-lli', stage: 'early' },
+    LAM: { key: 'LAM', name: 'Loss of active material', short: 'LAM', cssVar: '--mech-lam', stage: 'mid' },
+    RES: { key: 'RES', name: 'Resistance growth', short: 'R↑', cssVar: '--mech-res', stage: 'late' },
+  };
+
+  function buildCell(spec) {
+    const r = rng(spec.seed);
+    const step = 100;
+    const cycles = [];
+    for (let c = 0; c <= spec.maxCycle; c += step) cycles.push(c);
+    const N = cycles.length;
+
+    const refPeaks = BASE_PEAKS.map((p) => ({
+      mu: p.mu + (r() - 0.5) * 0.006, sigma: p.sigma * (1 + (r() - 0.5) * 0.08), amp: p.amp * (1 + (r() - 0.5) * 0.06),
+    }));
+    const icaRef = VOLT.map((v) => refPeaks.reduce((s, p) => s + gauss(v, p.mu, p.sigma, p.amp), 0));
+    const refArea = simpson(icaRef);
+
+    const rows = [], rawFade = [];
+    for (let i = 0; i < N; i++) {
+      const f = cycles[i] / spec.maxCycle;
+      const wl = spec.lli * kLLI(f), wm = spec.lam * kLAM(f), wr = spec.res * kRES(f);
+
+      // ICA peak evolution driven by the three signals
+      const peaks = refPeaks.map((p, k) => {
+        const shift = -wl * 0.10 * (1 + 0.12 * k);
+        const ampScale = 1 - Math.min(0.9, wm) * (0.8 + (k === 1 ? 0.2 : 0));
+        const widen = 1 + Math.min(1.3, wr) * 1.2;
+        return { mu: p.mu + shift, sigma: p.sigma * widen, amp: Math.max(0.05, p.amp * ampScale), shiftMv: shift * 1000 };
+      });
+      const ica = VOLT.map((v) => peaks.reduce((s, p) => s + gauss(v, p.mu, p.sigma, p.amp), 0));
+      const dq = ica.map((y, j) => y - icaRef[j]);
+      const feats = moments(dq);
+
+      // physics scalars (derived from the actual ICA where possible)
+      const meanShiftV = wl * 0.10;
+      const lamLoss = Math.max(0, 1 - simpson(ica) / (refArea + 1e-9));
+      const resGrowth = Math.min(1.3, wr) * 1.2;
+
+      const tot = wl + wm + wr;
+      const probs = { LLI: wl / (tot + 1e-9), LAM: wm / (tot + 1e-9), RES: wr / (tot + 1e-9) };
+      const dominant = tot < 0.10 ? 'EARLY' : (wl >= wm && wl >= wr ? 'LLI' : wm >= wr ? 'LAM' : 'RES');
+      const conf = Math.min(0.97, 0.55 + (Math.max(wl, wm, wr) / (tot + 1e-9)) * 0.5 - (r() - 0.5) * 0.03);
+
+      const diag = peaks.map((p, k) => ({
+        label: ['Graphite stage I', 'Graphite stage II', 'NMC H1→H2'][k],
+        voltage: p.mu, shiftMv: p.shiftMv, widthMv: p.sigma * 2.355 * 1000,
+        areaLossPct: (1 - p.amp / refPeaks[k].amp) * 100,
+      }));
+
+      rawFade.push(0.11 * wl + 0.17 * wm + 0.05 * wr);
+      rows.push({ cycle: cycles[i], lifeFrac: f, ica, dq, feats,
+        signals: { LLI: wl, LAM: wm, RES: wr },
+        phys: { meanShiftV, lamLoss, resGrowth, probs, dominant, conf, tot }, diag });
+    }
+
+    // SOH from fade, normalized so final ≈ declared EOL; add small noise; predict
+    const fadeEnd = rawFade[N - 1] || 1;
+    const targetFade = 1 - spec.eol;
+    const sohTrue = [], sohPred = [];
+    for (let i = 0; i < N; i++) {
+      let soh = 1 - rawFade[i] / fadeEnd * targetFade + (r() - 0.5) * 0.003;
+      sohTrue.push(soh);
+    }
+    for (let i = 0; i < N; i++) {
+      const res = (rng(spec.seed + i * 7)() - 0.5) * 0.016 + Math.sin(i * 0.7) * 0.004;
+      sohPred.push(sohTrue[i] + res);
+    }
+    const errs = sohTrue.map((t, i) => sohPred[i] - t);
+    const rmse = Math.sqrt(errs.reduce((s, e) => s + e * e, 0) / N);
+    const mae = errs.reduce((s, e) => s + Math.abs(e), 0) / N;
+    const ybar = sohTrue.reduce((s, v) => s + v, 0) / N;
+    const ssTot = sohTrue.reduce((s, v) => s + (v - ybar) ** 2, 0);
+    const r2 = 1 - errs.reduce((s, e) => s + e * e, 0) / ssTot;
+
+    let rul = null;
+    for (let i = 1; i < N; i++) {
+      if (sohPred[i] <= 0.80) {
+        const t = (0.80 - sohPred[i - 1]) / (sohPred[i] - sohPred[i - 1]);
+        rul = Math.round(cycles[i - 1] + t * step); break;
+      }
+    }
+
+    // ── phases: collapse the per-cycle dominant sequence into contiguous segments
+    const domSeq = rows.map((r2) => r2.phys.dominant);
+    let phases = [];
+    for (let i = 0; i < N; i++) {
+      const d = domSeq[i];
+      if (!phases.length || phases[phases.length - 1].mech !== d) {
+        phases.push({ mech: d, i0: i, i1: i });
+      } else phases[phases.length - 1].i1 = i;
+    }
+    // merge runs shorter than 3 samples into the previous phase
+    phases = phases.reduce((acc, p) => {
+      const len = p.i1 - p.i0 + 1;
+      if (acc.length && len < 3 && p.mech !== 'EARLY') { acc[acc.length - 1].i1 = p.i1; }
+      else acc.push(p);
+      return acc;
+    }, []);
+    phases = phases.map((p) => {
+      // peak share for this mechanism within the phase
+      let share = 0;
+      for (let i = p.i0; i <= p.i1; i++) {
+        const pr = rows[i].phys.probs[p.mech]; if (pr > share) share = pr;
+      }
+      return {
+        mech: p.mech,
+        startCycle: cycles[p.i0], endCycle: cycles[p.i1],
+        startFrac: p.i0 / (N - 1), endFrac: p.i1 / (N - 1),
+        sohStart: sohTrue[p.i0], sohEnd: sohTrue[p.i1],
+        peakShare: share, i0: p.i0, i1: p.i1,
+      };
+    });
+
+    // onset cycle per mechanism = first cycle its weighted signal crosses 0.12
+    const onsets = {};
+    for (const m of MECH_ORDER) {
+      onsets[m] = null;
+      for (let i = 0; i < N; i++) {
+        if (rows[i].signals[m] > 0.16) { onsets[m] = cycles[i]; break; }
+      }
+    }
+
+    return {
+      id: spec.id, chemistry: 'Graphite / NMC', form: 'Pouch', capacityMah: 740,
+      tempC: spec.temp, maxCycle: spec.maxCycle, nCycles: N, cycles, step,
+      sohTrue, sohPred, icaRef, rows,
+      metrics: { rmse, mae, r2 }, rul, eol: spec.eol,
+      sohLast: sohTrue[N - 1], cellDominant: phases.filter((p) => p.mech !== 'EARLY').slice(-1)[0]?.mech || 'LLI',
+      phases, onsets,
+    };
+  }
+
+  const cells = CELLS_SPEC.map(buildCell);
+  const byId = Object.fromEntries(cells.map((c) => [c.id, c]));
+
+  function overall() {
+    let n = 0, se = 0, ae = 0, all = [], allErr = [];
+    for (const c of cells) for (let i = 0; i < c.nCycles; i++) {
+      const e = c.sohPred[i] - c.sohTrue[i];
+      se += e * e; ae += Math.abs(e); n++; all.push(c.sohTrue[i]); allErr.push(e);
+    }
+    const ybar = all.reduce((s, v) => s + v, 0) / n;
+    const ssTot = all.reduce((s, v) => s + (v - ybar) ** 2, 0);
+    return { rmse: Math.sqrt(se / n), mae: ae / n, r2: 1 - allErr.reduce((s, e) => s + e * e, 0) / ssTot, n };
+  }
+
+  // ── batch-average pseudo-cell: aggregate the batch over normalized life ──
+  const mean = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+  const avgArrays = (arrs) => { const n = arrs[0].length, o = new Array(n).fill(0); for (const a of arrs) for (let i = 0; i < n; i++) o[i] += a[i]; for (let i = 0; i < n; i++) o[i] /= arrs.length; return o; };
+
+  function buildBatch(ids) {
+    const cs = (ids && ids.length ? ids : cells.map((c) => c.id)).map((id) => byId[id]).filter(Boolean);
+    const M = 81, maxCycle = Math.round(mean(cs.map((c) => c.maxCycle)));
+    const cycles = [], sohTrue = [], sohPred = [], rows = [];
+    const icaRef = avgArrays(cs.map((c) => c.icaRef));
+    for (let k = 0; k < M; k++) {
+      const f = k / (M - 1); cycles.push(Math.round(f * maxCycle));
+      const pk = cs.map((c) => { const idx = Math.round(f * (c.nCycles - 1)); return { r: c.rows[idx], st: c.sohTrue[idx], sp: c.sohPred[idx] }; });
+      sohTrue.push(mean(pk.map((p) => p.st))); sohPred.push(mean(pk.map((p) => p.sp)));
+      const ica = avgArrays(pk.map((p) => p.r.ica)), dq = avgArrays(pk.map((p) => p.r.dq)), feats = moments(dq);
+      const signals = { LLI: mean(pk.map((p) => p.r.signals.LLI)), LAM: mean(pk.map((p) => p.r.signals.LAM)), RES: mean(pk.map((p) => p.r.signals.RES)) };
+      const tot = signals.LLI + signals.LAM + signals.RES;
+      const probs = { LLI: signals.LLI / (tot + 1e-9), LAM: signals.LAM / (tot + 1e-9), RES: signals.RES / (tot + 1e-9) };
+      const dominant = tot < 0.10 ? 'EARLY' : (signals.LLI >= signals.LAM && signals.LLI >= signals.RES ? 'LLI' : signals.LAM >= signals.RES ? 'LAM' : 'RES');
+      const phys = { meanShiftV: mean(pk.map((p) => p.r.phys.meanShiftV)), lamLoss: mean(pk.map((p) => p.r.phys.lamLoss)), resGrowth: mean(pk.map((p) => p.r.phys.resGrowth)), probs, dominant, conf: mean(pk.map((p) => p.r.phys.conf)), tot };
+      const diag = [0, 1, 2].map((j) => ({ label: cs[0].rows[0].diag[j].label, voltage: mean(pk.map((p) => p.r.diag[j].voltage)), shiftMv: mean(pk.map((p) => p.r.diag[j].shiftMv)), widthMv: mean(pk.map((p) => p.r.diag[j].widthMv)), areaLossPct: mean(pk.map((p) => p.r.diag[j].areaLossPct)) }));
+      rows.push({ cycle: cycles[k], lifeFrac: f, ica, dq, feats, signals, phys, diag });
+    }
+    let phases = [];
+    const domSeq = rows.map((r) => r.phys.dominant);
+    for (let i = 0; i < M; i++) { const d = domSeq[i]; if (!phases.length || phases[phases.length - 1].mech !== d) phases.push({ mech: d, i0: i, i1: i }); else phases[phases.length - 1].i1 = i; }
+    phases = phases.reduce((acc, p) => { const len = p.i1 - p.i0 + 1; if (acc.length && len < 3 && p.mech !== 'EARLY') acc[acc.length - 1].i1 = p.i1; else acc.push(p); return acc; }, []);
+    phases = phases.map((p) => { let share = 0; for (let i = p.i0; i <= p.i1; i++) { const pr = rows[i].phys.probs[p.mech]; if (pr > share) share = pr; } return { mech: p.mech, startCycle: cycles[p.i0], endCycle: cycles[p.i1], startFrac: p.i0 / (M - 1), endFrac: p.i1 / (M - 1), sohStart: sohTrue[p.i0], sohEnd: sohTrue[p.i1], peakShare: share, i0: p.i0, i1: p.i1 }; });
+    const onsets = {};
+    for (const m of MECH_ORDER) { onsets[m] = null; for (let i = 0; i < M; i++) { if (rows[i].signals[m] > 0.16) { onsets[m] = cycles[i]; break; } } }
+    let rul = null;
+    for (let i = 1; i < M; i++) { if (sohPred[i] <= 0.80) { const t = (0.80 - sohPred[i - 1]) / (sohPred[i] - sohPred[i - 1]); rul = Math.round(cycles[i - 1] + t * (cycles[i] - cycles[i - 1])); break; } }
+    const ov = overall();
+    return { id: 'Batch average', chemistry: 'Graphite / NMC', form: 'Pouch', capacityMah: 740, tempC: Math.round(mean(cs.map((c) => c.tempC))), maxCycle, nCycles: M, cycles, step: Math.round(maxCycle / (M - 1)), sohTrue, sohPred, icaRef, rows, metrics: { r2: ov.r2, rmse: ov.rmse, mae: ov.mae }, rul, eol: mean(cs.map((c) => c.eol)), sohLast: sohTrue[M - 1], cellDominant: phases.filter((p) => p.mech !== 'EARLY').slice(-1)[0]?.mech || 'LLI', phases, onsets, isBatch: true, nCells: cs.length };
+  }
+
+  const featureImportance = [
+    { feature: 'dqv_log_variance', coefficient: -0.142 },
+    { feature: 'dqv_variance', coefficient: -0.087 },
+    { feature: 'dqv_max_deviation', coefficient: -0.061 },
+    { feature: 'dqv_integral_abs', coefficient: -0.054 },
+    { feature: 'dqv_rms', coefficient: -0.041 },
+    { feature: 'dqv_kurtosis', coefficient: 0.033 },
+    { feature: 'dqv_skewness', coefficient: 0.022 },
+  ].map((f) => ({ ...f, abs: Math.abs(f.coefficient) }));
+
+  const FEATURE_META = {
+    dqv_log_variance: { name: 'Log variance', desc: 'log of ΔQ(V) spread — primary degradation signal' },
+    dqv_variance: { name: 'Variance', desc: 'spread of ΔQ(V)' },
+    dqv_skewness: { name: 'Skewness', desc: 'asymmetry of ΔQ(V)' },
+    dqv_kurtosis: { name: 'Kurtosis', desc: 'tailedness' },
+    dqv_integral_abs: { name: 'Abs integral', desc: 'total |ΔQ| area' },
+    dqv_max_deviation: { name: 'Max deviation', desc: 'largest |ΔQ|' },
+    dqv_rms: { name: 'RMS', desc: 'root-mean-square of ΔQ(V)' },
+  };
+
+  // how each mechanism reads in dQ/dV space + how it is inferred
+  const MECH_INFO = {
+    LLI: { signature: 'Peaks shift to lower voltage', infer: 'Tracks peak-voltage displacement vs. the fresh-cell baseline (Hungarian peak matching).', when: 'Early life' },
+    LAM: { signature: 'Peak heights & total area shrink', infer: 'Integrates ICA area loss — fewer host sites means less charge per peak.', when: 'Mid life' },
+    RES: { signature: 'Peaks broaden & flatten', infer: 'Measures peak FWHM growth — polarisation smears the phase transitions.', when: 'Late life' },
+  };
+
+  window.SOHData = {
+    VOLT, V_MIN, V_MAX, GRID_MV, cells, byId, cellIds: cells.map((c) => c.id),
+    overall: overall(), buildBatch, featureImportance, FEATURE_META, MECH, MECH_ORDER, MECH_INFO,
+    EOL_THRESHOLD: 0.80,
+  };
+})();
+
+</script>
+<script type="text/babel">
+
+/* BEGIN USAGE */
+// tweaks-panel.jsx
+// Reusable Tweaks shell + form-control helpers.
+// Exports (to window): useTweaks, TweaksPanel, TweakSection, TweakRow, TweakSlider,
+//   TweakToggle, TweakRadio, TweakSelect, TweakText, TweakNumber, TweakColor, TweakButton.
+//
+// Owns the host protocol (listens for __activate_edit_mode / __deactivate_edit_mode,
+// posts __edit_mode_available / __edit_mode_set_keys / __edit_mode_dismissed) so
+// individual prototypes don't re-roll it. Ships a consistent set of controls so you
+// don't hand-draw <input type="range">, segmented radios, steppers, etc.
+//
+// Usage (in an HTML file that loads React + Babel):
+//
+//   const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+//     "primaryColor": "#D97757",
+//     "palette": ["#D97757", "#29261b", "#f6f4ef"],
+//     "fontSize": 16,
+//     "density": "regular",
+//     "dark": false
+//   }/*EDITMODE-END*/;
+//
+//   function App() {
+//     const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+//     return (
+//       <div style={{ fontSize: t.fontSize, color: t.primaryColor }}>
+//         Hello
+//         <TweaksPanel>
+//           <TweakSection label="Typography" />
+//           <TweakSlider label="Font size" value={t.fontSize} min={10} max={32} unit="px"
+//                        onChange={(v) => setTweak('fontSize', v)} />
+//           <TweakRadio  label="Density" value={t.density}
+//                        options={['compact', 'regular', 'comfy']}
+//                        onChange={(v) => setTweak('density', v)} />
+//           <TweakSection label="Theme" />
+//           <TweakColor  label="Primary" value={t.primaryColor}
+//                        options={['#D97757', '#2A6FDB', '#1F8A5B', '#7A5AE0']}
+//                        onChange={(v) => setTweak('primaryColor', v)} />
+//           <TweakColor  label="Palette" value={t.palette}
+//                        options={[['#D97757', '#29261b', '#f6f4ef'],
+//                                  ['#475569', '#0f172a', '#f1f5f9']]}
+//                        onChange={(v) => setTweak('palette', v)} />
+//           <TweakToggle label="Dark mode" value={t.dark}
+//                        onChange={(v) => setTweak('dark', v)} />
+//         </TweaksPanel>
+//       </div>
+//     );
+//   }
+//
+// TweakRadio is the segmented control for 2–3 short options (auto-falls-back to
+// TweakSelect past ~16/~10 chars per label); reach for TweakSelect directly when
+// options are many or long. For color tweaks always curate 3-4 options rather than
+// a free picker; an option can also be a whole 2–5 color palette (the stored value
+// is the array). The Tweak* controls are a floor, not a ceiling — build custom
+// controls inside the panel if a tweak calls for UI they don't cover.
+/* END USAGE */
+// ─────────────────────────────────────────────────────────────────────────────
+
+const __TWEAKS_STYLE = `
+  .twk-panel{position:fixed;right:16px;bottom:16px;z-index:2147483646;width:280px;
+    max-height:calc(100vh - 32px);display:flex;flex-direction:column;
+    transform:scale(var(--dc-inv-zoom,1));transform-origin:bottom right;
+    background:rgba(250,249,247,.78);color:#29261b;
+    -webkit-backdrop-filter:blur(24px) saturate(160%);backdrop-filter:blur(24px) saturate(160%);
+    border:.5px solid rgba(255,255,255,.6);border-radius:14px;
+    box-shadow:0 1px 0 rgba(255,255,255,.5) inset,0 12px 40px rgba(0,0,0,.18);
+    font:11.5px/1.4 ui-sans-serif,system-ui,-apple-system,sans-serif;overflow:hidden}
+  .twk-hd{display:flex;align-items:center;justify-content:space-between;
+    padding:10px 8px 10px 14px;cursor:move;user-select:none}
+  .twk-hd b{font-size:12px;font-weight:600;letter-spacing:.01em}
+  .twk-x{appearance:none;border:0;background:transparent;color:rgba(41,38,27,.55);
+    width:22px;height:22px;border-radius:6px;cursor:default;font-size:13px;line-height:1}
+  .twk-x:hover{background:rgba(0,0,0,.06);color:#29261b}
+  .twk-body{padding:2px 14px 14px;display:flex;flex-direction:column;gap:10px;
+    overflow-y:auto;overflow-x:hidden;min-height:0;
+    scrollbar-width:thin;scrollbar-color:rgba(0,0,0,.15) transparent}
+  .twk-body::-webkit-scrollbar{width:8px}
+  .twk-body::-webkit-scrollbar-track{background:transparent;margin:2px}
+  .twk-body::-webkit-scrollbar-thumb{background:rgba(0,0,0,.15);border-radius:4px;
+    border:2px solid transparent;background-clip:content-box}
+  .twk-body::-webkit-scrollbar-thumb:hover{background:rgba(0,0,0,.25);
+    border:2px solid transparent;background-clip:content-box}
+  .twk-row{display:flex;flex-direction:column;gap:5px}
+  .twk-row-h{flex-direction:row;align-items:center;justify-content:space-between;gap:10px}
+  .twk-lbl{display:flex;justify-content:space-between;align-items:baseline;
+    color:rgba(41,38,27,.72)}
+  .twk-lbl>span:first-child{font-weight:500}
+  .twk-val{color:rgba(41,38,27,.5);font-variant-numeric:tabular-nums}
+
+  .twk-sect{font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+    color:rgba(41,38,27,.45);padding:10px 0 0}
+  .twk-sect:first-child{padding-top:0}
+
+  .twk-field{appearance:none;box-sizing:border-box;width:100%;min-width:0;height:26px;padding:0 8px;
+    border:.5px solid rgba(0,0,0,.1);border-radius:7px;
+    background:rgba(255,255,255,.6);color:inherit;font:inherit;outline:none}
+  .twk-field:focus{border-color:rgba(0,0,0,.25);background:rgba(255,255,255,.85)}
+  select.twk-field{padding-right:22px;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='rgba(0,0,0,.5)' d='M0 0h10L5 6z'/></svg>");
+    background-repeat:no-repeat;background-position:right 8px center}
+
+  .twk-slider{appearance:none;-webkit-appearance:none;width:100%;height:4px;margin:6px 0;
+    border-radius:999px;background:rgba(0,0,0,.12);outline:none}
+  .twk-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;
+    width:14px;height:14px;border-radius:50%;background:#fff;
+    border:.5px solid rgba(0,0,0,.12);box-shadow:0 1px 3px rgba(0,0,0,.2);cursor:default}
+  .twk-slider::-moz-range-thumb{width:14px;height:14px;border-radius:50%;
+    background:#fff;border:.5px solid rgba(0,0,0,.12);box-shadow:0 1px 3px rgba(0,0,0,.2);cursor:default}
+
+  .twk-seg{position:relative;display:flex;padding:2px;border-radius:8px;
+    background:rgba(0,0,0,.06);user-select:none}
+  .twk-seg-thumb{position:absolute;top:2px;bottom:2px;border-radius:6px;
+    background:rgba(255,255,255,.9);box-shadow:0 1px 2px rgba(0,0,0,.12);
+    transition:left .15s cubic-bezier(.3,.7,.4,1),width .15s}
+  .twk-seg.dragging .twk-seg-thumb{transition:none}
+  .twk-seg button{appearance:none;position:relative;z-index:1;flex:1;border:0;
+    background:transparent;color:inherit;font:inherit;font-weight:500;min-height:22px;
+    border-radius:6px;cursor:default;padding:4px 6px;line-height:1.2;
+    overflow-wrap:anywhere}
+
+  .twk-toggle{position:relative;width:32px;height:18px;border:0;border-radius:999px;
+    background:rgba(0,0,0,.15);transition:background .15s;cursor:default;padding:0}
+  .twk-toggle[data-on="1"]{background:#34c759}
+  .twk-toggle i{position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;
+    background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25);transition:transform .15s}
+  .twk-toggle[data-on="1"] i{transform:translateX(14px)}
+
+  .twk-num{display:flex;align-items:center;box-sizing:border-box;min-width:0;height:26px;padding:0 0 0 8px;
+    border:.5px solid rgba(0,0,0,.1);border-radius:7px;background:rgba(255,255,255,.6)}
+  .twk-num-lbl{font-weight:500;color:rgba(41,38,27,.6);cursor:ew-resize;
+    user-select:none;padding-right:8px}
+  .twk-num input{flex:1;min-width:0;height:100%;border:0;background:transparent;
+    font:inherit;font-variant-numeric:tabular-nums;text-align:right;padding:0 8px 0 0;
+    outline:none;color:inherit;-moz-appearance:textfield}
+  .twk-num input::-webkit-inner-spin-button,.twk-num input::-webkit-outer-spin-button{
+    -webkit-appearance:none;margin:0}
+  .twk-num-unit{padding-right:8px;color:rgba(41,38,27,.45)}
+
+  .twk-btn{appearance:none;height:26px;padding:0 12px;border:0;border-radius:7px;
+    background:rgba(0,0,0,.78);color:#fff;font:inherit;font-weight:500;cursor:default}
+  .twk-btn:hover{background:rgba(0,0,0,.88)}
+  .twk-btn.secondary{background:rgba(0,0,0,.06);color:inherit}
+  .twk-btn.secondary:hover{background:rgba(0,0,0,.1)}
+
+  .twk-swatch{appearance:none;-webkit-appearance:none;width:56px;height:22px;
+    border:.5px solid rgba(0,0,0,.1);border-radius:6px;padding:0;cursor:default;
+    background:transparent;flex-shrink:0}
+  .twk-swatch::-webkit-color-swatch-wrapper{padding:0}
+  .twk-swatch::-webkit-color-swatch{border:0;border-radius:5.5px}
+  .twk-swatch::-moz-color-swatch{border:0;border-radius:5.5px}
+
+  .twk-chips{display:flex;gap:6px}
+  .twk-chip{position:relative;appearance:none;flex:1;min-width:0;height:46px;
+    padding:0;border:0;border-radius:6px;overflow:hidden;cursor:default;
+    box-shadow:0 0 0 .5px rgba(0,0,0,.12),0 1px 2px rgba(0,0,0,.06);
+    transition:transform .12s cubic-bezier(.3,.7,.4,1),box-shadow .12s}
+  .twk-chip:hover{transform:translateY(-1px);
+    box-shadow:0 0 0 .5px rgba(0,0,0,.18),0 4px 10px rgba(0,0,0,.12)}
+  .twk-chip[data-on="1"]{box-shadow:0 0 0 1.5px rgba(0,0,0,.85),
+    0 2px 6px rgba(0,0,0,.15)}
+  .twk-chip>span{position:absolute;top:0;bottom:0;right:0;width:34%;
+    display:flex;flex-direction:column;box-shadow:-1px 0 0 rgba(0,0,0,.1)}
+  .twk-chip>span>i{flex:1;box-shadow:0 -1px 0 rgba(0,0,0,.1)}
+  .twk-chip>span>i:first-child{box-shadow:none}
+  .twk-chip svg{position:absolute;top:6px;left:6px;width:13px;height:13px;
+    filter:drop-shadow(0 1px 1px rgba(0,0,0,.3))}
+`;
+
+// ── useTweaks ───────────────────────────────────────────────────────────────
+// Single source of truth for tweak values. setTweak persists via the host
+// (__edit_mode_set_keys → host rewrites the EDITMODE block on disk).
+function useTweaks(defaults) {
+  const [values, setValues] = React.useState(defaults);
+  // Accepts either setTweak('key', value) or setTweak({ key: value, ... }) so a
+  // useState-style call doesn't write a "[object Object]" key into the persisted
+  // JSON block.
+  const setTweak = React.useCallback((keyOrEdits, val) => {
+    const edits = typeof keyOrEdits === 'object' && keyOrEdits !== null
+      ? keyOrEdits : { [keyOrEdits]: val };
+    setValues((prev) => ({ ...prev, ...edits }));
+    window.parent.postMessage({ type: '__edit_mode_set_keys', edits }, '*');
+    // Same-window signal so in-page listeners (deck-stage rail thumbnails)
+    // can react — the parent message only reaches the host, not peers.
+    window.dispatchEvent(new CustomEvent('tweakchange', { detail: edits }));
+  }, []);
+  return [values, setTweak];
+}
+
+// ── TweaksPanel ─────────────────────────────────────────────────────────────
+// Floating shell. Registers the protocol listener BEFORE announcing
+// availability — if the announce ran first, the host's activate could land
+// before our handler exists and the toolbar toggle would silently no-op.
+// The close button posts __edit_mode_dismissed so the host's toolbar toggle
+// flips off in lockstep; the host echoes __deactivate_edit_mode back which
+// is what actually hides the panel.
+function TweaksPanel({ title = 'Tweaks', children }) {
+  const [open, setOpen] = React.useState(false);
+  const dragRef = React.useRef(null);
+  const offsetRef = React.useRef({ x: 16, y: 16 });
+  const PAD = 16;
+
+  const clampToViewport = React.useCallback(() => {
+    const panel = dragRef.current;
+    if (!panel) return;
+    const w = panel.offsetWidth, h = panel.offsetHeight;
+    const maxRight = Math.max(PAD, window.innerWidth - w - PAD);
+    const maxBottom = Math.max(PAD, window.innerHeight - h - PAD);
+    offsetRef.current = {
+      x: Math.min(maxRight, Math.max(PAD, offsetRef.current.x)),
+      y: Math.min(maxBottom, Math.max(PAD, offsetRef.current.y)),
+    };
+    panel.style.right = offsetRef.current.x + 'px';
+    panel.style.bottom = offsetRef.current.y + 'px';
+  }, []);
+
+  React.useEffect(() => {
+    if (!open) return;
+    clampToViewport();
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', clampToViewport);
+      return () => window.removeEventListener('resize', clampToViewport);
+    }
+    const ro = new ResizeObserver(clampToViewport);
+    ro.observe(document.documentElement);
+    return () => ro.disconnect();
+  }, [open, clampToViewport]);
+
+  React.useEffect(() => {
+    const onMsg = (e) => {
+      const t = e?.data?.type;
+      if (t === '__activate_edit_mode') setOpen(true);
+      else if (t === '__deactivate_edit_mode') setOpen(false);
+    };
+    window.addEventListener('message', onMsg);
+    window.parent.postMessage({ type: '__edit_mode_available' }, '*');
+    return () => window.removeEventListener('message', onMsg);
+  }, []);
+
+  const dismiss = () => {
+    setOpen(false);
+    window.parent.postMessage({ type: '__edit_mode_dismissed' }, '*');
+  };
+
+  const onDragStart = (e) => {
+    const panel = dragRef.current;
+    if (!panel) return;
+    const r = panel.getBoundingClientRect();
+    const sx = e.clientX, sy = e.clientY;
+    const startRight = window.innerWidth - r.right;
+    const startBottom = window.innerHeight - r.bottom;
+    const move = (ev) => {
+      offsetRef.current = {
+        x: startRight - (ev.clientX - sx),
+        y: startBottom - (ev.clientY - sy),
+      };
+      clampToViewport();
+    };
+    const up = () => {
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  };
+
+  if (!open) return null;
+  return (
+    <>
+      <style>{__TWEAKS_STYLE}</style>
+      <div ref={dragRef} className="twk-panel" data-omelette-chrome=""
+           style={{ right: offsetRef.current.x, bottom: offsetRef.current.y }}>
+        <div className="twk-hd" onMouseDown={onDragStart}>
+          <b>{title}</b>
+          <button className="twk-x" aria-label="Close tweaks"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={dismiss}>✕</button>
+        </div>
+        <div className="twk-body">
+          {children}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ── Layout helpers ──────────────────────────────────────────────────────────
+
+function TweakSection({ label, children }) {
+  return (
+    <>
+      <div className="twk-sect">{label}</div>
+      {children}
+    </>
+  );
+}
+
+function TweakRow({ label, value, children, inline = false }) {
+  return (
+    <div className={inline ? 'twk-row twk-row-h' : 'twk-row'}>
+      <div className="twk-lbl">
+        <span>{label}</span>
+        {value != null && <span className="twk-val">{value}</span>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// ── Controls ────────────────────────────────────────────────────────────────
+
+function TweakSlider({ label, value, min = 0, max = 100, step = 1, unit = '', onChange }) {
+  return (
+    <TweakRow label={label} value={`${value}${unit}`}>
+      <input type="range" className="twk-slider" min={min} max={max} step={step}
+             value={value} onChange={(e) => onChange(Number(e.target.value))} />
+    </TweakRow>
+  );
+}
+
+function TweakToggle({ label, value, onChange }) {
+  return (
+    <div className="twk-row twk-row-h">
+      <div className="twk-lbl"><span>{label}</span></div>
+      <button type="button" className="twk-toggle" data-on={value ? '1' : '0'}
+              role="switch" aria-checked={!!value}
+              onClick={() => onChange(!value)}><i /></button>
+    </div>
+  );
+}
+
+function TweakRadio({ label, value, options, onChange }) {
+  const trackRef = React.useRef(null);
+  const [dragging, setDragging] = React.useState(false);
+  // The active value is read by pointer-move handlers attached for the lifetime
+  // of a drag — ref it so a stale closure doesn't fire onChange for every move.
+  const valueRef = React.useRef(value);
+  valueRef.current = value;
+
+  // Segments wrap mid-word once per-segment width runs out. The track is
+  // ~248px (280 panel − 28 body pad − 4 seg pad), each button loses 12px
+  // to its own padding, and 11.5px system-ui averages ~6.3px/char — so 2
+  // options fit ~16 chars each, 3 fit ~10. Past that (or >3 options), fall
+  // back to a dropdown rather than wrap.
+  const labelLen = (o) => String(typeof o === 'object' ? o.label : o).length;
+  const maxLen = options.reduce((m, o) => Math.max(m, labelLen(o)), 0);
+  const fitsAsSegments = maxLen <= ({ 2: 16, 3: 10 }[options.length] ?? 0);
+  if (!fitsAsSegments) {
+    // <select> emits strings — map back to the original option value so the
+    // fallback stays type-preserving (numbers, booleans) like the segment path.
+    const resolve = (s) => {
+      const m = options.find((o) => String(typeof o === 'object' ? o.value : o) === s);
+      return m === undefined ? s : typeof m === 'object' ? m.value : m;
+    };
+    return <TweakSelect label={label} value={value} options={options}
+                        onChange={(s) => onChange(resolve(s))} />;
+  }
+  const opts = options.map((o) => (typeof o === 'object' ? o : { value: o, label: o }));
+  const idx = Math.max(0, opts.findIndex((o) => o.value === value));
+  const n = opts.length;
+
+  const segAt = (clientX) => {
+    const r = trackRef.current.getBoundingClientRect();
+    const inner = r.width - 4;
+    const i = Math.floor(((clientX - r.left - 2) / inner) * n);
+    return opts[Math.max(0, Math.min(n - 1, i))].value;
+  };
+
+  const onPointerDown = (e) => {
+    setDragging(true);
+    const v0 = segAt(e.clientX);
+    if (v0 !== valueRef.current) onChange(v0);
+    const move = (ev) => {
+      if (!trackRef.current) return;
+      const v = segAt(ev.clientX);
+      if (v !== valueRef.current) onChange(v);
+    };
+    const up = () => {
+      setDragging(false);
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+
+  return (
+    <TweakRow label={label}>
+      <div ref={trackRef} role="radiogroup" onPointerDown={onPointerDown}
+           className={dragging ? 'twk-seg dragging' : 'twk-seg'}>
+        <div className="twk-seg-thumb"
+             style={{ left: `calc(2px + ${idx} * (100% - 4px) / ${n})`,
+                      width: `calc((100% - 4px) / ${n})` }} />
+        {opts.map((o) => (
+          <button key={o.value} type="button" role="radio" aria-checked={o.value === value}>
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </TweakRow>
+  );
+}
+
+function TweakSelect({ label, value, options, onChange }) {
+  return (
+    <TweakRow label={label}>
+      <select className="twk-field" value={value} onChange={(e) => onChange(e.target.value)}>
+        {options.map((o) => {
+          const v = typeof o === 'object' ? o.value : o;
+          const l = typeof o === 'object' ? o.label : o;
+          return <option key={v} value={v}>{l}</option>;
+        })}
+      </select>
+    </TweakRow>
+  );
+}
+
+function TweakText({ label, value, placeholder, onChange }) {
+  return (
+    <TweakRow label={label}>
+      <input className="twk-field" type="text" value={value} placeholder={placeholder}
+             onChange={(e) => onChange(e.target.value)} />
+    </TweakRow>
+  );
+}
+
+function TweakNumber({ label, value, min, max, step = 1, unit = '', onChange }) {
+  const clamp = (n) => {
+    if (min != null && n < min) return min;
+    if (max != null && n > max) return max;
+    return n;
+  };
+  const startRef = React.useRef({ x: 0, val: 0 });
+  const onScrubStart = (e) => {
+    e.preventDefault();
+    startRef.current = { x: e.clientX, val: value };
+    const decimals = (String(step).split('.')[1] || '').length;
+    const move = (ev) => {
+      const dx = ev.clientX - startRef.current.x;
+      const raw = startRef.current.val + dx * step;
+      const snapped = Math.round(raw / step) * step;
+      onChange(clamp(Number(snapped.toFixed(decimals))));
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+  return (
+    <div className="twk-num">
+      <span className="twk-num-lbl" onPointerDown={onScrubStart}>{label}</span>
+      <input type="number" value={value} min={min} max={max} step={step}
+             onChange={(e) => onChange(clamp(Number(e.target.value)))} />
+      {unit && <span className="twk-num-unit">{unit}</span>}
+    </div>
+  );
+}
+
+// Relative-luminance contrast pick — checkmarks drawn over a swatch need to
+// read on both #111 and #fafafa without per-option configuration. Hex input
+// only (#rgb / #rrggbb); named or rgb()/hsl() colors fall through to "light".
+function __twkIsLight(hex) {
+  const h = String(hex).replace('#', '');
+  const x = h.length === 3 ? h.replace(/./g, (c) => c + c) : h.padEnd(6, '0');
+  const n = parseInt(x.slice(0, 6), 16);
+  if (Number.isNaN(n)) return true;
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  return r * 299 + g * 587 + b * 114 > 148000;
+}
+
+const __TwkCheck = ({ light }) => (
+  <svg viewBox="0 0 14 14" aria-hidden="true">
+    <path d="M3 7.2 5.8 10 11 4.2" fill="none" strokeWidth="2.2"
+          strokeLinecap="round" strokeLinejoin="round"
+          stroke={light ? 'rgba(0,0,0,.78)' : '#fff'} />
+  </svg>
+);
+
+// TweakColor — curated color/palette picker. Each option is either a single
+// hex string or an array of 1-5 hex strings; the card adapts — a lone color
+// renders solid, a palette renders colors[0] as the hero (left ~2/3) with the
+// rest stacked in a sharp column on the right. onChange emits the
+// option in the shape it was passed (string stays string, array stays array).
+// Without options it falls back to the native color input for back-compat.
+function TweakColor({ label, value, options, onChange }) {
+  if (!options || !options.length) {
+    return (
+      <div className="twk-row twk-row-h">
+        <div className="twk-lbl"><span>{label}</span></div>
+        <input type="color" className="twk-swatch" value={value}
+               onChange={(e) => onChange(e.target.value)} />
+      </div>
+    );
+  }
+  // Native <input type=color> emits lowercase hex per the HTML spec, so
+  // compare case-insensitively. String() guards JSON.stringify(undefined),
+  // which returns the primitive undefined (no .toLowerCase).
+  const key = (o) => String(JSON.stringify(o)).toLowerCase();
+  const cur = key(value);
+  return (
+    <TweakRow label={label}>
+      <div className="twk-chips" role="radiogroup">
+        {options.map((o, i) => {
+          const colors = Array.isArray(o) ? o : [o];
+          const [hero, ...rest] = colors;
+          const sup = rest.slice(0, 4);
+          const on = key(o) === cur;
+          return (
+            <button key={i} type="button" className="twk-chip" role="radio"
+                    aria-checked={on} data-on={on ? '1' : '0'}
+                    aria-label={colors.join(', ')} title={colors.join(' · ')}
+                    style={{ background: hero }}
+                    onClick={() => onChange(o)}>
+              {sup.length > 0 && (
+                <span>
+                  {sup.map((c, j) => <i key={j} style={{ background: c }} />)}
+                </span>
+              )}
+              {on && <__TwkCheck light={__twkIsLight(hero)} />}
+            </button>
+          );
+        })}
+      </div>
+    </TweakRow>
+  );
+}
+
+function TweakButton({ label, onClick, secondary = false }) {
+  return (
+    <button type="button" className={secondary ? 'twk-btn secondary' : 'twk-btn'}
+            onClick={onClick}>{label}</button>
+  );
+}
+
+Object.assign(window, {
+  useTweaks, TweaksPanel, TweakSection, TweakRow,
+  TweakSlider, TweakToggle, TweakRadio, TweakSelect,
+  TweakText, TweakNumber, TweakColor, TweakButton,
+});
+
+</script>
+<script type="text/babel">
+/* soh-charts.jsx — canvas charts for the SOH batch flow.
+ * Exports: useCanvas, SOHLine, MechTimeline, ICASketch, Spark.
+ * Synchronous draw (no rAF — throttled in embedded iframes) + resize/late-layout retries.
+ */
+
+function useCanvas(draw, deps) {
+  const ref = React.useRef(null);
+  const drawRef = React.useRef(draw);
+  drawRef.current = draw;
+  React.useEffect(() => {
+    const cvs = ref.current;
+    if (!cvs) return;
+    let dead = false;
+    const render = () => {
+      if (dead) return;
+      const parent = cvs.parentElement;
+      if (!parent) return;
+      const w = parent.clientWidth, h = parent.clientHeight;
+      if (w === 0 || h === 0) return;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      cvs.width = w * dpr; cvs.height = h * dpr;
+      cvs.style.width = w + 'px'; cvs.style.height = h + 'px';
+      const ctx = cvs.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+      drawRef.current(ctx, w, h);
+    };
+    render();
+    const timers = [60, 220, 600].map((ms) => setTimeout(render, ms));
+    const ro = new ResizeObserver(render);
+    ro.observe(cvs.parentElement);
+    return () => { dead = true; timers.forEach(clearTimeout); ro.disconnect(); };
+  }, deps); // eslint-disable-line
+  return ref;
+}
+
+const scale = (dmin, dmax, rmin, rmax) => { const s = (dmax - dmin) || 1; return (v) => rmin + (v - dmin) / s * (rmax - rmin); };
+const fmtCyc = (n) => n >= 1000 ? (n / 1000).toFixed(n % 1000 ? 1 : 0) + 'k' : String(Math.round(n));
+const MV = { LLI: '--mech-lli', LAM: '--mech-lam', RES: '--mech-res' };
+function cssRGB(el, varName) {
+  const v = getComputedStyle(el).getPropertyValue(varName).trim();
+  return v || '#888';
+}
+
+// ───────────────────────── SOH trajectory ─────────────────────────
+// predicted (glow) vs measured (dashed), uncertainty band, EOL line,
+// faint mechanism-phase background shading, onset markers, selected cycle.
+function SOHLine({ cell, selIdx, onSelect, pal, showBand, showPhases, height }) {
+  const padL = 50, padR = 16, padT = 16, padB = 30;
+  const geomRef = React.useRef(null);
+  const hostRef = React.useRef(null);
+
+  const ref = useCanvas((ctx, w, h) => {
+    const host = hostRef.current;
+    const cyc = cell.cycles, n = cyc.length;
+    const x = scale(0, cell.maxCycle, padL, w - padR);
+    const y = scale(0.78, 1.005, h - padB, padT);
+    geomRef.current = { x, w };
+
+    // mechanism phase shading
+    if (showPhases) {
+      for (const ph of cell.phases) {
+        if (ph.mech === 'EARLY') continue;
+        const x0 = x(ph.startCycle), x1 = x(ph.endCycle);
+        const col = cssRGB(host, MV[ph.mech]);
+        ctx.fillStyle = col; ctx.globalAlpha = 0.07;
+        ctx.fillRect(x0, padT, x1 - x0, h - padB - padT);
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // grid + y labels
+    ctx.font = '10px "IBM Plex Mono", monospace'; ctx.textBaseline = 'middle';
+    for (let g = 0.80; g <= 1.0; g += 0.05) {
+      const yy = y(g);
+      ctx.strokeStyle = pal.grid; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(w - padR, yy); ctx.stroke();
+      ctx.fillStyle = pal.faint; ctx.textAlign = 'right';
+      ctx.fillText((g * 100).toFixed(0) + '%', padL - 7, yy);
+    }
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    for (let i = 0; i <= 5; i++) { const cv = cell.maxCycle * i / 5; ctx.fillStyle = pal.faint; ctx.fillText(fmtCyc(cv), x(cv), h - padB + 7); }
+
+    // EOL threshold
+    const yEol = y(0.80);
+    ctx.strokeStyle = pal.danger; ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, yEol); ctx.lineTo(w - padR, yEol); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = pal.danger; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'; ctx.font = '9px "IBM Plex Mono", monospace';
+    ctx.fillText('EOL · 80%', padL + 4, yEol - 3);
+
+    // onset markers
+    ctx.textBaseline = 'top';
+    let onsetRow = 0;
+    for (const m of window.SOHData.MECH_ORDER) {
+      const oc = cell.onsets[m]; if (oc == null || oc <= 0) continue;
+      const px = x(oc), col = cssRGB(host, MV[m]);
+      ctx.strokeStyle = col; ctx.globalAlpha = 0.5; ctx.lineWidth = 1; ctx.setLineDash([2, 3]);
+      ctx.beginPath(); ctx.moveTo(px, padT); ctx.lineTo(px, h - padB); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      ctx.fillStyle = col; ctx.font = '600 9px "IBM Plex Mono", monospace'; ctx.textAlign = 'left';
+      ctx.fillText(window.SOHData.MECH[m].short + ' onset', px + 3, padT + 1 + (onsetRow % 2) * 12);
+      onsetRow++;
+    }
+
+    // uncertainty band
+    if (showBand) {
+      ctx.beginPath();
+      for (let i = 0; i < n; i++) { const rr = Math.abs(cell.sohPred[i] - cell.sohTrue[i]) + 0.006; const px = x(cyc[i]), py = y(cell.sohPred[i] + rr); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }
+      for (let i = n - 1; i >= 0; i--) { const rr = Math.abs(cell.sohPred[i] - cell.sohTrue[i]) + 0.006; ctx.lineTo(x(cyc[i]), y(cell.sohPred[i] - rr)); }
+      ctx.closePath(); ctx.fillStyle = pal.accentFill; ctx.fill();
+    }
+
+    // measured (dashed)
+    ctx.strokeStyle = pal.dim; ctx.lineWidth = 1.4; ctx.setLineDash([5, 4]);
+    ctx.beginPath(); for (let i = 0; i < n; i++) { const px = x(cyc[i]), py = y(cell.sohTrue[i]); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); } ctx.stroke(); ctx.setLineDash([]);
+
+    // predicted (glow accent)
+    ctx.save(); ctx.shadowColor = pal.accent; ctx.shadowBlur = 10;
+    ctx.strokeStyle = pal.accent; ctx.lineWidth = 2.4; ctx.lineJoin = 'round';
+    ctx.beginPath(); for (let i = 0; i < n; i++) { const px = x(cyc[i]), py = y(cell.sohPred[i]); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); } ctx.stroke();
+    ctx.restore();
+
+    // selected cycle marker
+    if (selIdx >= 0 && selIdx < n) {
+      const px = x(cyc[selIdx]), py = y(cell.sohPred[selIdx]);
+      ctx.strokeStyle = pal.text; ctx.globalAlpha = 0.45; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(px, padT); ctx.lineTo(px, h - padB); ctx.stroke(); ctx.globalAlpha = 1;
+      ctx.fillStyle = pal.accent; ctx.beginPath(); ctx.arc(px, py, 5, 0, 7); ctx.fill();
+      ctx.strokeStyle = pal.panel; ctx.lineWidth = 2; ctx.stroke();
+    }
+  }, [cell, selIdx, pal, showBand, showPhases, height]);
+
+  const pick = (e) => {
+    const g = geomRef.current; if (!g) return -1;
+    const rect = e.currentTarget.getBoundingClientRect(), mx = e.clientX - rect.left;
+    let best = -1, bd = Infinity;
+    for (let i = 0; i < cell.cycles.length; i++) { const d = Math.abs(g.x(cell.cycles[i]) - mx); if (d < bd) { bd = d; best = i; } }
+    return best;
+  };
+  return (
+    <div ref={hostRef} style={{ position: 'relative', width: '100%', height: height || '100%' }}>
+      <canvas ref={ref} style={{ cursor: onSelect ? 'crosshair' : 'default', display: 'block' }}
+        onPointerDown={(e) => onSelect && onSelect(pick(e))}
+        onPointerMove={(e) => { if (e.buttons === 1 && onSelect) onSelect(pick(e)); }} />
+    </div>
+  );
+}
+
+// ───────────────────────── mechanism timeline ─────────────────────────
+// horizontal band over the cycle axis, segmented by dominant mechanism.
+function MechTimeline({ cell, selIdx, onSelect, pal }) {
+  const padL = 50, padR = 16;
+  const hostRef = React.useRef(null);
+  const geomRef = React.useRef(null);
+  const ref = useCanvas((ctx, w, h) => {
+    const host = hostRef.current;
+    const x = scale(0, cell.maxCycle, padL, w - padR);
+    geomRef.current = { x };
+    const top = 6, barH = h - 26;
+    for (const ph of cell.phases) {
+      const x0 = x(ph.startCycle), x1 = x(ph.endCycle);
+      if (ph.mech === 'EARLY') {
+        ctx.fillStyle = pal.track; ctx.fillRect(x0, top, x1 - x0, barH);
+        ctx.fillStyle = pal.faint; ctx.font = '600 9px "IBM Plex Sans", sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        if (x1 - x0 > 40) ctx.fillText('early', (x0 + x1) / 2, top + barH / 2);
+        continue;
+      }
+      const col = cssRGB(host, MV[ph.mech]);
+      ctx.fillStyle = col; ctx.globalAlpha = 0.85; ctx.fillRect(x0, top, x1 - x0, barH); ctx.globalAlpha = 1;
+      ctx.fillStyle = '#fff'; ctx.font = '600 10px "IBM Plex Sans", sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      if (x1 - x0 > 46) ctx.fillText(window.SOHData.MECH[ph.mech].short, (x0 + x1) / 2, top + barH / 2);
+    }
+    // axis ticks
+    ctx.fillStyle = pal.faint; ctx.font = '9px "IBM Plex Mono", monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    for (let i = 0; i <= 5; i++) { const cv = cell.maxCycle * i / 5; ctx.fillText(fmtCyc(cv), x(cv), top + barH + 5); }
+    // current cycle pin
+    if (selIdx >= 0) {
+      const px = x(cell.cycles[selIdx]);
+      ctx.fillStyle = pal.text; ctx.beginPath(); ctx.moveTo(px, top - 5); ctx.lineTo(px - 4, top - 1); ctx.lineTo(px + 4, top - 1); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = pal.text; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(px, top); ctx.lineTo(px, top + barH); ctx.stroke();
+    }
+  }, [cell, selIdx, pal]);
+  const pick = (e) => {
+    const g = geomRef.current; if (!g) return -1;
+    const rect = e.currentTarget.getBoundingClientRect(), mx = e.clientX - rect.left;
+    let best = -1, bd = Infinity;
+    for (let i = 0; i < cell.cycles.length; i++) { const d = Math.abs(g.x(cell.cycles[i]) - mx); if (d < bd) { bd = d; best = i; } }
+    return best;
+  };
+  return (
+    <div ref={hostRef} style={{ position: 'relative', width: '100%', height: '100%' }}>
+      <canvas ref={ref} style={{ cursor: onSelect ? 'crosshair' : 'default', display: 'block' }}
+        onPointerDown={(e) => onSelect && onSelect(pick(e))} />
+    </div>
+  );
+}
+
+// ───────────────────────── ICA sketch (explainer) ─────────────────────────
+// small illustrative dQ/dV: fresh baseline + a distorted curve for `mode`.
+function ICASketch({ mode, pal, accent }) {
+  const ref = useCanvas((ctx, w, h) => {
+    const padX = 8, padB = 4, padT = 6;
+    const x = scale(3.3, 4.05, padX, w - padX);
+    const peaks = [{ mu: 3.5, s: 0.05, a: 0.5 }, { mu: 3.66, s: 0.042, a: 0.85 }, { mu: 3.9, s: 0.06, a: 0.45 }];
+    const y = scale(0, 1, h - padB, padT);
+    const curve = (transform) => {
+      ctx.beginPath();
+      for (let i = 0; i <= 120; i++) {
+        const v = 3.3 + (4.05 - 3.3) * i / 120;
+        let val = 0;
+        for (const p of peaks) { const t = transform(p); val += t.a * Math.exp(-0.5 * ((v - t.mu) / t.s) ** 2); }
+        const px = x(v), py = y(val); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+      }
+    };
+    // baseline (faint, dashed)
+    ctx.strokeStyle = pal.dim; ctx.lineWidth = 1.2; ctx.setLineDash([3, 3]);
+    curve((p) => p); ctx.stroke(); ctx.setLineDash([]);
+    // transformed
+    const tf = {
+      LLI: (p) => ({ mu: p.mu - 0.05, s: p.s, a: p.a * 0.92 }),
+      LAM: (p) => ({ mu: p.mu, s: p.s, a: p.a * 0.55 }),
+      RES: (p) => ({ mu: p.mu, s: p.s * 1.9, a: p.a * 0.72 }),
+    }[mode] || ((p) => p);
+    ctx.save(); ctx.shadowColor = accent; ctx.shadowBlur = 6;
+    ctx.strokeStyle = accent; ctx.lineWidth = 2; curve(tf); ctx.stroke(); ctx.restore();
+  }, [mode, pal, accent]);
+  return <div style={{ width: '100%', height: '100%' }}><canvas ref={ref} style={{ display: 'block' }} /></div>;
+}
+
+// ───────────────────────── sparkline ─────────────────────────
+function Spark({ values, pal, color, marker, w = 80, h = 22 }) {
+  const ref = useCanvas((ctx, cw, ch) => {
+    const n = values.length; let mn = Infinity, mx = -Infinity;
+    for (const v of values) { if (v < mn) mn = v; if (v > mx) mx = v; }
+    const x = scale(0, n - 1, 2, cw - 2), y = scale(mn, mx, ch - 3, 3);
+    ctx.strokeStyle = color || pal.accent; ctx.lineWidth = 1.3; ctx.lineJoin = 'round';
+    ctx.beginPath(); for (let i = 0; i < n; i++) { const px = x(i), py = y(values[i]); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); } ctx.stroke();
+    if (marker != null && marker >= 0 && marker < n) { ctx.fillStyle = color || pal.accent; ctx.beginPath(); ctx.arc(x(marker), y(values[marker]), 2, 0, 7); ctx.fill(); }
+  }, [values, pal, color, marker]);
+  return <div style={{ width: w, height: h }}><canvas ref={ref} style={{ display: 'block' }} /></div>;
+}
+
+Object.assign(window, { useCanvas, SOHLine, MechTimeline, ICASketch, Spark });
+
+</script>
+<script type="text/babel">
+/* soh-panels.jsx — shared UI primitives for the SOH batch flow.
+ * Exports: TweakCtx, Panel, StatTile, MechBadge, MechDot, fmt, useDense.
+ */
+const TweakCtx = React.createContext({ density: 'comfortable' });
+function useDense() { return React.useContext(TweakCtx).density === 'compact'; }
+
+const fmt = {
+  soh: (v) => (v * 100).toFixed(1) + '%',
+  pct0: (v) => Math.round(v * 100) + '%',
+  mv: (v) => (v >= 0 ? '+' : '') + v.toFixed(0) + ' mV',
+  cyc: (n) => Math.round(n).toLocaleString(),
+  sci: (v) => { const a = Math.abs(v); if (v === 0) return '0'; if (a >= 0.01 && a < 1e4) return v.toFixed(a < 1 ? 3 : 2); return v.toExponential(2); },
+};
+const MV = { LLI: '--mech-lli', LAM: '--mech-lam', RES: '--mech-res' };
+
+function Panel({ title, sub, right, children, style, bodyStyle, flush }) {
+  const c = useDense();
+  return (
+    <section style={{ background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 12, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden', ...style }}>
+      {title && (
+        <header style={{ display: 'flex', alignItems: 'baseline', gap: 9, padding: c ? '8px 13px' : '11px 16px', borderBottom: '1px solid var(--border)', flex: '0 0 auto' }}>
+          <h3 style={{ margin: 0, font: '600 ' + (c ? '12px' : '13px') + '/1 "IBM Plex Sans", sans-serif', letterSpacing: '.01em', color: 'var(--text)' }}>{title}</h3>
+          {sub && <span style={{ font: '400 10.5px/1 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>{sub}</span>}
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>{right}</div>
+        </header>
+      )}
+      <div style={{ flex: '1 1 auto', minHeight: 0, padding: flush ? 0 : (c ? 12 : 16), ...bodyStyle }}>{children}</div>
+    </section>
+  );
+}
+
+function StatTile({ label, value, unit, sub, tone, big }) {
+  const c = useDense();
+  const color = tone === 'accent' ? 'var(--accent)' : tone === 'danger' ? 'var(--danger)' : 'var(--text)';
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+      <span style={{ font: '500 9.5px/1 "IBM Plex Sans", sans-serif', letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--faint)', whiteSpace: 'nowrap' }}>{label}</span>
+      <span style={{ font: `600 ${big ? (c ? 24 : 30) : (c ? 17 : 21)}px/1 "IBM Plex Mono", monospace`, color, letterSpacing: '-.01em', fontVariantNumeric: 'tabular-nums' }}>
+        {value}{unit && <span style={{ fontSize: '0.55em', color: 'var(--dim)', marginLeft: 3 }}>{unit}</span>}
+      </span>
+      {sub && <span style={{ font: '400 10px/1.3 "IBM Plex Mono", monospace', color: 'var(--dim)' }}>{sub}</span>}
+    </div>
+  );
+}
+
+function MechDot({ mech, size = 9 }) {
+  return <span style={{ width: size, height: size, borderRadius: 3, background: mech === 'EARLY' ? 'var(--faint)' : `var(${MV[mech]})`, flex: '0 0 auto', display: 'inline-block' }} />;
+}
+
+function MechBadge({ dominant, confidence }) {
+  if (dominant === 'EARLY') return <span style={badge('var(--faint)')}>Early life · indeterminate</span>;
+  const v = `var(${MV[dominant]})`;
+  return (
+    <span style={{ ...badge(v), display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+      <span style={{ width: 7, height: 7, borderRadius: '50%', background: v }} />
+      {window.SOHData.MECH[dominant].name}
+      {confidence != null && <span style={{ opacity: 0.7 }}>· {Math.round(confidence * 100)}%</span>}
+    </span>
+  );
+}
+function badge(color) {
+  return { font: '600 11px/1 "IBM Plex Sans", sans-serif', color, padding: '5px 10px', border: `1px solid ${color}`, borderRadius: 999, background: 'color-mix(in srgb, ' + color + ' 12%, transparent)', whiteSpace: 'nowrap' };
+}
+
+Object.assign(window, { TweakCtx, useDense, Panel, StatTile, MechDot, MechBadge, fmt });
+
+</script>
+<script type="text/babel">
+/* soh-explainer.jsx — educational strip above the trajectory.
+ * Explains ICA / dQ/dV and the three degradation mechanisms with mini sketches.
+ * Exports window.Explainer.
+ */
+function Explainer({ pal, accent, collapsed, onToggle }) {
+  const info = window.SOHData.MECH_INFO, MECH = window.SOHData.MECH;
+  const order = window.SOHData.MECH_ORDER;
+
+  return (
+    <Panel
+      title="Reading dQ/dV — what the model sees"
+      sub="incremental capacity analysis"
+      right={
+        <button onClick={onToggle} style={{ font: '500 10.5px/1 "IBM Plex Mono", monospace', color: 'var(--dim)', background: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: 7, padding: '4px 9px', cursor: 'pointer' }}>
+          {collapsed ? 'Show guide ▸' : 'Hide guide ▾'}
+        </button>
+      }
+      bodyStyle={{ padding: collapsed ? 0 : 16, display: collapsed ? 'none' : 'block' }}
+    >
+      {!collapsed && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(200px, 1.1fr) repeat(3, minmax(180px, 1fr))', gap: 16 }}>
+          {/* primer */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 9, paddingRight: 14, borderRight: '1px solid var(--border)' }}>
+            <div style={{ font: '600 12px/1.3 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>What is dQ/dV?</div>
+            <div style={{ font: '400 11.5px/1.5 "IBM Plex Sans", sans-serif', color: 'var(--dim)' }}>
+              The derivative of charge with respect to voltage. Flat voltage plateaus during charging become <span style={{ color: 'var(--text)' }}>sharp peaks</span> — each marks a phase transition in the electrodes.
+            </div>
+            <div style={{ height: 52, marginTop: 2 }}><ICASketch mode="base" pal={pal} accent={accent} /></div>
+            <div style={{ font: '400 10px/1.4 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>
+              As a cell ages, these peaks move, shrink, and broaden — and <span style={{ color: 'var(--accent)' }}>how</span> they change tells you <span style={{ color: 'var(--accent)' }}>why</span>.
+            </div>
+          </div>
+
+          {/* mechanism cards */}
+          {order.map((m) => (
+            <div key={m} style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', rowGap: 3 }}>
+                <MechDot mech={m} size={10} />
+                <span style={{ font: '600 12px/1.25 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>{MECH[m].name}</span>
+                <span style={{ font: '600 8.5px/1 "IBM Plex Sans", sans-serif', color: `var(${({ LLI: '--mech-lli', LAM: '--mech-lam', RES: '--mech-res' })[m]})`, letterSpacing: '.06em', textTransform: 'uppercase', border: `1px solid color-mix(in srgb, var(${({ LLI: '--mech-lli', LAM: '--mech-lam', RES: '--mech-res' })[m]}) 45%, transparent)`, borderRadius: 999, padding: '2px 6px' }}>{info[m].when}</span>
+              </div>
+              <div style={{ height: 46, background: 'var(--panel-2)', borderRadius: 8, padding: 4 }}>
+                <ICASketch mode={m} pal={pal} accent={`var(${({ LLI: '--mech-lli', LAM: '--mech-lam', RES: '--mech-res' })[m]})`} />
+              </div>
+              <div style={{ font: '600 10.5px/1.4 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>{info[m].signature}</div>
+              <div style={{ font: '400 10.5px/1.45 "IBM Plex Sans", sans-serif', color: 'var(--dim)' }}>{info[m].infer}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </Panel>
+  );
+}
+window.Explainer = Explainer;
+
+</script>
+<script type="text/babel">
+/* soh-report.jsx — degradation report: where each mechanism occurs.
+ * Exports window.MechReport.
+ */
+const RV = { LLI: '--mech-lli', LAM: '--mech-lam', RES: '--mech-res' };
+
+function aggregateMechanism(cell, m) {
+  const phs = cell.phases.filter((p) => p.mech === m);
+  if (!phs.length) return null;
+  const startCycle = Math.min(...phs.map((p) => p.startCycle));
+  const endCycle = Math.max(...phs.map((p) => p.endCycle));
+  let peakShare = 0, peakI = phs[0].i0;
+  for (const p of phs) { if (p.peakShare > peakShare) { peakShare = p.peakShare; peakI = Math.round((p.i0 + p.i1) / 2); } }
+  return { startCycle, endCycle, peakShare, peakI, onset: cell.onsets[m] ?? startCycle,
+    sohStart: cell.sohTrue[phs[0].i0], sohEnd: cell.sohTrue[phs[phs.length - 1].i1] };
+}
+
+function evidenceFor(cell, m, i) {
+  const row = cell.rows[i], g = row.diag[1];
+  if (m === 'LLI') return [`graphite peak shifted ${fmt.mv(g.shiftMv)}`, `peak-match confidence ${Math.round(row.phys.conf * 100)}%`];
+  if (m === 'LAM') return [`ICA area down ${Math.round(row.phys.lamLoss * 100)}%`, `peak heights reduced across transitions`];
+  return [`peaks broadened ${Math.round(row.phys.resGrowth * 100)}%`, `FWHM widened to ${g.widthMv.toFixed(0)} mV`];
+}
+
+function MechReportCard({ cell, m, selIdx }) {
+  const agg = aggregateMechanism(cell, m);
+  const MECH = window.SOHData.MECH[m];
+  const col = `var(${RV[m]})`;
+  const activeNow = cell.rows[selIdx].phys.dominant === m;
+  if (!agg) {
+    return (
+      <div style={{ flex: '1 1 0', minWidth: 0, background: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: 11, padding: 14, opacity: 0.55 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}><MechDot mech={m} /><span style={{ font: '600 12px/1.2 "IBM Plex Sans", sans-serif', color: 'var(--dim)' }}>{MECH.name}</span></div>
+        <div style={{ marginTop: 10, font: '400 11px/1.4 "IBM Plex Sans", sans-serif', color: 'var(--faint)' }}>Not dominant for this cell within the recorded window.</div>
+      </div>
+    );
+  }
+  const ev = evidenceFor(cell, m, agg.peakI);
+  return (
+    <div style={{ flex: '1 1 0', minWidth: 0, background: 'var(--panel)', border: '1px solid ' + (activeNow ? col : 'var(--border)'), borderRadius: 11, overflow: 'hidden', boxShadow: activeNow ? `0 0 0 1px ${col}, 0 4px 18px -8px ${col}` : 'none', transition: 'box-shadow .2s, border-color .2s' }}>
+      <div style={{ height: 3, background: col }} />
+      <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 11 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <MechDot mech={m} size={10} />
+          <span style={{ font: '600 12.5px/1.2 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>{MECH.name}</span>
+          {activeNow && <span style={{ marginLeft: 'auto', font: '600 9px/1 "IBM Plex Sans", sans-serif', letterSpacing: '.06em', textTransform: 'uppercase', color: col, border: `1px solid ${col}`, borderRadius: 999, padding: '3px 7px' }}>active now</span>}
+        </div>
+
+        {/* occurrence window */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '11px 18px' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span style={lbl}>Onset</span>
+            <span style={{ ...val, color: col }}>{fmt.cyc(agg.onset)}<span style={cyc}> cyc</span></span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span style={lbl}>Dominant window</span>
+            <span style={val}>{fmt.cyc(agg.startCycle)}–{fmt.cyc(agg.endCycle)}</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span style={lbl}>Peak share</span>
+            <span style={val}>{fmt.pct0(agg.peakShare)}</span>
+          </div>
+        </div>
+
+        {/* SOH band where it acts */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, font: '400 10.5px/1.3 "IBM Plex Mono", monospace', color: 'var(--dim)' }}>
+          <span>SOH {fmt.soh(agg.sohStart)} → {fmt.soh(agg.sohEnd)}</span>
+        </div>
+
+        {/* evidence */}
+        <ul style={{ margin: 0, padding: 0, listStyle: 'none', display: 'flex', flexDirection: 'column', gap: 5 }}>
+          {ev.map((e, i) => (
+            <li key={i} style={{ display: 'flex', gap: 7, font: '400 11px/1.4 "IBM Plex Sans", sans-serif', color: 'var(--dim)' }}>
+              <span style={{ color: col, flex: '0 0 auto' }}>›</span><span>{e}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+const lbl = { font: '500 9px/1 "IBM Plex Sans", sans-serif', letterSpacing: '.05em', textTransform: 'uppercase', color: 'var(--faint)', whiteSpace: 'nowrap' };
+const val = { font: '600 14px/1 "IBM Plex Mono", monospace', color: 'var(--text)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' };
+const cyc = { fontSize: '0.6em', color: 'var(--dim)', marginLeft: 2 };
+
+function MechReport({ cell, selIdx }) {
+  return (
+    <div style={{ display: 'flex', gap: 12, height: '100%' }}>
+      {window.SOHData.MECH_ORDER.map((m) => <MechReportCard key={m} cell={cell} m={m} selIdx={selIdx} />)}
+    </div>
+  );
+}
+window.MechReport = MechReport;
+
+</script>
+<script type="text/babel">
+/* soh-flow.jsx — batch flow shell: upload CSVs → train → SOH trajectory + report.
+ * Single unified layout. Exports window.SOHFlow.
+ */
+const ACCENTS = { teal: [40, 196, 178], blue: [78, 150, 240], amber: [232, 137, 63], violet: [150, 110, 235] };
+
+function buildPal(theme, rgb) {
+  const dark = theme === 'dark';
+  const a = `rgb(${rgb.join(',')})`;
+  return {
+    accent: a, accentFill: `rgba(${rgb.join(',')},0.13)`,
+    grid: dark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.07)',
+    faint: dark ? 'rgba(233,236,239,0.36)' : 'rgba(20,22,26,0.42)',
+    dim: dark ? 'rgba(233,236,239,0.64)' : 'rgba(20,22,26,0.60)',
+    text: dark ? '#e8eaed' : '#16181c', panel: dark ? '#15171c' : '#ffffff',
+    danger: dark ? '#e5604d' : '#c8402c', track: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.07)',
+  };
+}
+function rootVars(theme, rgb) {
+  const dark = theme === 'dark';
+  return {
+    '--panel': dark ? '#15171c' : '#ffffff', '--panel-2': dark ? '#1b1e25' : '#f3f5f7',
+    '--border': dark ? 'rgba(255,255,255,0.09)' : 'rgba(0,0,0,0.10)',
+    '--text': dark ? '#e8eaed' : '#16181c', '--dim': dark ? 'rgba(233,236,239,0.64)' : 'rgba(20,22,26,0.60)',
+    '--faint': dark ? 'rgba(233,236,239,0.38)' : 'rgba(20,22,26,0.44)',
+    '--accent': `rgb(${rgb.join(',')})`, '--accent-ghost': `rgba(${rgb.join(',')},0.14)`,
+    '--hover': dark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.035)', '--track': dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.07)',
+    '--danger': dark ? '#e5604d' : '#c8402c', '--mech-lli': '#4d9bf0', '--mech-lam': '#3fc98a', '--mech-res': '#e86bb0',
+    background: dark ? '#0b0c0f' : '#eceef1', color: dark ? '#e8eaed' : '#16181c',
+  };
+}
+
+// ───────────────────────── stepper ─────────────────────────
+function Stepper({ stage, onJump, trained }) {
+  const steps = [['upload', 'Upload'], ['training', 'Train'], ['report', 'Report']];
+  const idx = { upload: 0, training: 1, report: 2 }[stage];
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+      {steps.map(([key, label], i) => {
+        const done = i < idx, cur = i === idx;
+        const clickable = key === 'upload' || (key === 'report' && trained);
+        return (
+          <React.Fragment key={key}>
+            <button disabled={!clickable} onClick={() => clickable && onJump(key)}
+              style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '5px 11px', borderRadius: 999, cursor: clickable ? 'pointer' : 'default',
+                border: '1px solid ' + (cur ? 'var(--accent)' : 'transparent'), background: cur ? 'var(--accent-ghost)' : 'transparent' }}>
+              <span style={{ width: 18, height: 18, borderRadius: '50%', display: 'grid', placeItems: 'center', font: '600 10px/1 "IBM Plex Mono", monospace',
+                background: done || cur ? 'var(--accent)' : 'var(--track)', color: done || cur ? '#06120f' : 'var(--faint)' }}>{done ? '✓' : i + 1}</span>
+              <span style={{ font: '600 11.5px/1 "IBM Plex Sans", sans-serif', color: cur ? 'var(--text)' : 'var(--dim)' }}>{label}</span>
+            </button>
+            {i < 2 && <span style={{ width: 18, height: 1, background: 'var(--border)' }} />}
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+// ───────────────────────── cycle scrubber ─────────────────────────
+function Scrubber({ cell, selIdx, onSelect, pal }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+      <button onClick={() => onSelect(Math.max(0, selIdx - 1))} style={navBtn}>‹</button>
+      <input type="range" min={0} max={cell.nCycles - 1} value={selIdx} onChange={(e) => onSelect(+e.target.value)} style={{ width: 150, accentColor: pal.accent, cursor: 'pointer' }} />
+      <button onClick={() => onSelect(Math.min(cell.nCycles - 1, selIdx + 1))} style={navBtn}>›</button>
+      <div style={{ minWidth: 70, textAlign: 'right' }}>
+        <div style={{ font: '500 9px/1 "IBM Plex Sans", sans-serif', letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--faint)' }}>Cycle</div>
+        <div style={{ font: '600 16px/1.1 "IBM Plex Mono", monospace', color: 'var(--accent)', fontVariantNumeric: 'tabular-nums' }}>{fmt.cyc(cell.cycles[selIdx])}</div>
+      </div>
+    </div>
+  );
+}
+const navBtn = { width: 26, height: 26, borderRadius: 7, cursor: 'pointer', border: '1px solid var(--border)', background: 'var(--panel-2)', color: 'var(--dim)', font: '400 16px/1 system-ui', display: 'grid', placeItems: 'center', flex: '0 0 auto' };
+
+// ───────────────────────── left rail ─────────────────────────
+function LeftRail({ cell, selIdx, onSelectCell, pal, model, scopeIds, batchCell }) {
+  const data = window.SOHData, o = data.overall;
+  const ids = scopeIds && scopeIds.length ? scopeIds : data.cellIds;
+  const cells = ids.map((id) => data.byId[id]);
+  const single = ids.length === 1;
+  const onBatch = !!(cell && cell.isBatch);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
+      <Panel title="Batch" sub={cells.length + ' cells'} style={{ flex: '1 1 auto' }} bodyStyle={{ overflow: 'auto' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {batchCell && (
+            <button onClick={() => onSelectCell('BATCH')} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '8px 9px', borderRadius: 8, cursor: 'pointer', marginBottom: 4,
+              border: '1px solid ' + (onBatch ? 'var(--accent)' : 'var(--border)'), background: onBatch ? 'var(--accent-ghost)' : 'var(--panel-2)' }}>
+              <span style={{ width: 6, height: 30, borderRadius: 3, background: 'var(--accent)', opacity: onBatch ? 1 : 0.6, flex: '0 0 auto' }} />
+              <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+                <div style={{ font: '600 12px/1.2 "IBM Plex Sans", sans-serif', color: onBatch ? 'var(--text)' : 'var(--dim)' }}>Batch average</div>
+                <div style={{ font: '400 9.5px/1.3 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>mean of {batchCell.nCells} cells</div>
+              </div>
+              <Spark values={batchCell.sohPred} pal={pal} color={onBatch ? pal.accent : pal.dim} w={48} h={20} marker={onBatch ? selIdx : null} />
+            </button>
+          )}
+          {cells.map((c) => {
+            const active = !onBatch && c.id === cell.id, dom = c.cellDominant;
+            const dc = `var(${({ LLI: '--mech-lli', LAM: '--mech-lam', RES: '--mech-res' })[dom]})`;
+            return (
+              <button key={c.id} onClick={() => onSelectCell(c.id)} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '8px 9px', borderRadius: 8, cursor: 'pointer',
+                border: '1px solid ' + (active ? 'var(--accent)' : 'transparent'), background: active ? 'var(--accent-ghost)' : 'transparent' }}
+                onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'var(--hover)'; }} onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}>
+                <span style={{ width: 6, height: 30, borderRadius: 3, background: dc, opacity: active ? 1 : 0.5, flex: '0 0 auto' }} />
+                <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+                  <div style={{ font: '600 12px/1.2 "IBM Plex Mono", monospace', color: active ? 'var(--text)' : 'var(--dim)' }}>{c.id}</div>
+                  <div style={{ font: '400 9.5px/1.3 "IBM Plex Sans", sans-serif', color: 'var(--faint)' }}>{c.tempC}°C · {data.MECH[dom].short} · {fmt.cyc(c.maxCycle)} cyc</div>
+                </div>
+                <Spark values={c.sohPred} pal={pal} color={active ? pal.accent : pal.dim} w={48} h={20} marker={active ? selIdx : null} />
+              </button>
+            );
+          })}
+        </div>
+      </Panel>
+
+      <Panel title="SOH model" sub={model ? model.name : 'ElasticNet · LOCO'} style={{ flex: '0 0 auto' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 11 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+            <StatTile label="R²" value={(model ? model.r2 : cell.metrics.r2).toFixed(3)} tone="accent" />
+            <StatTile label="RMSE" value={(model ? model.rmse : cell.metrics.rmse).toFixed(4)} />
+            <StatTile label="MAE" value={(model ? model.mae : cell.metrics.mae).toFixed(4)} />
+          </div>
+          <div style={{ font: '400 9.5px/1.4 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>{single ? 'cross-validated on training batch' : `pooled R² ${o.r2.toFixed(3)} · n=${o.n} predictions`}</div>
+        </div>
+      </Panel>
+
+      <Panel title="Prognosis" style={{ flex: '0 0 auto' }}>
+        <div style={{ display: 'flex', gap: 18 }}>
+          <StatTile label="RUL → 80%" value={cell.rul ? fmt.cyc(cell.rul) : '—'} unit={cell.rul ? 'cyc' : ''} tone={cell.rul && cell.rul < 4000 ? 'danger' : 'accent'} />
+          <StatTile label="Final SOH" value={fmt.soh(cell.sohLast)} tone={cell.sohLast < 0.82 ? 'danger' : undefined} />
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+// ───────────────────────── timeline legend ─────────────────────────
+function TimelineLegend() {
+  const data = window.SOHData;
+  return (
+    <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
+      {data.MECH_ORDER.map((m) => (
+        <div key={m} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <MechDot mech={m} size={9} />
+          <span style={{ font: '500 10.5px/1 "IBM Plex Sans", sans-serif', color: 'var(--dim)' }}>{data.MECH[m].short}</span>
+          <span style={{ font: '400 9.5px/1 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>{data.MECH_INFO[m].when.toLowerCase()}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ───────────────────────── single-cell prediction summary ─────────────────────────
+function SingleSummary({ cell, model, selIdx, pal }) {
+  const data = window.SOHData;
+  const dom = cell.cellDominant;
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 20, background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 12, padding: '14px 18px' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <span style={{ font: '600 9px/1 "IBM Plex Sans", sans-serif', letterSpacing: '.1em', textTransform: 'uppercase', color: 'var(--accent)' }}>Single-cell prediction</span>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+          <span style={{ font: '600 19px/1 "IBM Plex Mono", monospace', color: 'var(--text)' }}>{cell.id}</span>
+          <span style={{ font: '400 11px/1 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>{cell.chemistry} · {cell.capacityMah} mAh · {cell.tempC}°C</span>
+        </div>
+      </div>
+      <span style={{ width: 1, height: 38, background: 'var(--border)' }} />
+      <StatTile label="Pred SOH" value={fmt.soh(cell.sohPred[selIdx])} sub={`cycle ${fmt.cyc(cell.cycles[selIdx])}`} tone="accent" />
+      <StatTile label="RUL → 80%" value={cell.rul ? fmt.cyc(cell.rul) : '—'} unit={cell.rul ? 'cyc' : ''} tone={cell.rul && cell.rul < 4000 ? 'danger' : undefined} />
+      <StatTile label="Final SOH" value={fmt.soh(cell.sohLast)} tone={cell.sohLast < 0.82 ? 'danger' : undefined} />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <span style={{ font: '500 9.5px/1 "IBM Plex Sans", sans-serif', letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--faint)' }}>Dominant pathway</span>
+        <MechBadge dominant={dom} confidence={cell.rows[cell.nCycles - 1].phys.conf} />
+      </div>
+      {model && (
+        <div style={{ marginLeft: 'auto', textAlign: 'right', flex: '0 0 auto' }}>
+          <div style={{ font: '400 10px/1.3 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>scored with</div>
+          <div style={{ font: '600 12px/1.3 "IBM Plex Sans", sans-serif', color: 'var(--dim)', whiteSpace: 'nowrap' }}>{model.name}</div>
+          <div style={{ font: '400 10px/1.3 "IBM Plex Mono", monospace', color: 'var(--faint)', whiteSpace: 'nowrap' }}>R² {model.r2.toFixed(3)} · RMSE {model.rmse.toFixed(4)}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+window.SOHFlowParts = { ACCENTS, buildPal, rootVars, Stepper, Scrubber, LeftRail, TimelineLegend, SingleSummary };
+
+</script>
+<script type="text/babel">
+/* soh-landing.jsx */
+(function () {
+  function seedModels(data) {
+    const all = data.cellIds;
+    return [
+      { id: 'm_nmc_v3', name: 'NMC-pouch · v3', typeKey: 'nmc', type: 'Graphite / NMC', form: 'Oxford pouch', cells: all.length, cellIds: all, r2: 0.987, rmse: 0.0094, mae: 0.0071, date: '2026-05-21', seed: true },
+      { id: 'm_nmc_v2', name: 'NMC-pouch · v2', typeKey: 'nmc', type: 'Graphite / NMC', form: 'Oxford pouch', cells: 5, cellIds: all.slice(0, 5), r2: 0.981, rmse: 0.0112, mae: 0.0085, date: '2026-04-08', seed: true },
+      { id: 'm_lfp_v1', name: 'LFP-cyl · baseline', typeKey: 'lfp', type: 'LFP / graphite', form: 'Severson cylindrical', cells: 8, cellIds: [], r2: 0.972, rmse: 0.0140, mae: 0.0102, date: '2026-03-02', seed: true, locked: true },
+    ];
+  }
+
+  function ModelCard({ m, onUse }) {
+    return (
+      <div style={{ background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 11, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 11 }}>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+            <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+              <div style={{ font: '600 13.5px/1.2 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>{m.name}</div>
+              <div style={{ font: '400 10px/1.3 "IBM Plex Mono", monospace', color: 'var(--faint)', marginTop: 3 }}>trained {m.date} · {m.cells} cells</div>
+            </div>
+            {m.locked && <span style={{ font: '500 9px/1 "IBM Plex Mono", monospace', color: 'var(--faint)', border: '1px solid var(--border)', borderRadius: 999, padding: '3px 7px' }}>demo only</span>}
+          </div>
+          <div style={{ display: 'flex', gap: 16 }}>
+            <StatTile label="R²" value={m.r2.toFixed(3)} tone="accent" />
+            <StatTile label="RMSE" value={m.rmse.toFixed(4)} />
+            <StatTile label="MAE" value={m.mae.toFixed(4)} />
+          </div>
+          <button disabled={m.locked} onClick={() => !m.locked && onUse(m)}
+            style={{ marginTop: 2, font: '600 11.5px/1 "IBM Plex Sans", sans-serif', color: m.locked ? 'var(--faint)' : 'var(--accent)', background: 'transparent', border: '1px solid ' + (m.locked ? 'var(--border)' : 'var(--accent)'), borderRadius: 8, padding: '8px 12px', cursor: m.locked ? 'default' : 'pointer', textAlign: 'left' }}>
+            {m.locked ? 'No demo data available' : 'Use this model → predict on a new cell'}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  function LandingStage({ pal, models, onTrainNew, onUseModel }) {
+    const groups = {};
+    for (const m of models) (groups[m.type] = groups[m.type] || []).push(m);
+    const pipeline = ['ICA dQ/dV', 'ΔQ(V) features', 'ElasticNet LOCO', 'SOH · LLI · LAM · R↑'];
+    return (
+      <div style={{ height: '100%', overflow: 'auto' }}>
+        <div style={{ width: 'min(980px, 100%)', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 24 }}>
+
+          {/* hero */}
+          <div style={{ padding: '36px 0 28px', borderBottom: '1px solid var(--border)' }}>
+            <div style={{ font: '700 54px/1 "IBM Plex Mono", monospace', color: 'var(--text)', letterSpacing: '-.025em' }}>
+              dQ/dV <span style={{ color: 'var(--accent)' }}>→</span> SOH
+            </div>
+            <div style={{ marginTop: 14, font: '400 15px/1.6 "IBM Plex Sans", sans-serif', color: 'var(--dim)', maxWidth: 620 }}>
+              Upload battery cycle data, train a physics-aware ElasticNet on incremental capacity signatures, and find out exactly which degradation mechanism is limiting your cells.
+            </div>
+            <div style={{ marginTop: 18, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              {pipeline.map((s, i, arr) => (
+                <React.Fragment key={s}>
+                  <span style={{ font: '500 11.5px/1 "IBM Plex Mono", monospace', color: i === arr.length - 1 ? 'var(--accent)' : 'var(--dim)', whiteSpace: 'nowrap' }}>{s}</span>
+                  {i < arr.length - 1 && <span style={{ color: 'var(--faint)', fontSize: 12 }}>→</span>}
+                </React.Fragment>
+              ))}
+            </div>
+          </div>
+
+          {/* train new */}
+          <button onClick={onTrainNew} style={{ display: 'flex', alignItems: 'center', gap: 14, textAlign: 'left', border: '1.5px dashed var(--accent)', background: 'var(--accent-ghost)', borderRadius: 12, padding: '16px 18px', cursor: 'pointer' }}>
+            <div style={{ width: 38, height: 38, borderRadius: 10, background: 'var(--accent)', color: '#06120f', display: 'grid', placeItems: 'center', font: '300 22px/1 system-ui', flex: '0 0 auto' }}>+</div>
+            <div>
+              <div style={{ font: '600 13.5px/1.2 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>Train a new model</div>
+              <div style={{ font: '400 11px/1.3 "IBM Plex Sans", sans-serif', color: 'var(--dim)', marginTop: 3 }}>Upload cycle CSVs for a batch of cells → leave-one-cell-out cross-validation</div>
+            </div>
+            <span style={{ marginLeft: 'auto', font: '600 18px/1 system-ui', color: 'var(--accent)' }}>→</span>
+          </button>
+
+          {/* model groups */}
+          {Object.entries(groups).map(([type, ms]) => (
+            <div key={type} style={{ display: 'flex', flexDirection: 'column', gap: 11 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+                <span style={{ font: '600 11px/1 "IBM Plex Sans", sans-serif', letterSpacing: '.05em', textTransform: 'uppercase', color: 'var(--dim)' }}>{type}</span>
+                <span style={{ font: '400 10px/1 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>{ms[0].form} · {ms.length} model{ms.length > 1 ? 's' : ''}</span>
+                <span style={{ flex: '1 1 auto', height: 1, background: 'var(--border)' }} />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 12 }}>
+                {ms.map((m) => <ModelCard key={m.id} m={m} onUse={onUseModel} />)}
+              </div>
+            </div>
+          ))}
+          <div style={{ height: 8 }} />
+        </div>
+      </div>
+    );
+  }
+
+  function Dropzone({ title, sub, onClick }) {
+    return (
+      <div onClick={onClick} style={{ border: '1.5px dashed var(--border)', borderRadius: 12, padding: '22px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 7, background: 'var(--panel)', cursor: onClick ? 'pointer' : 'default' }}>
+        <div style={{ width: 38, height: 38, borderRadius: 10, background: 'var(--accent-ghost)', display: 'grid', placeItems: 'center', color: 'var(--accent)', font: '300 21px/1 system-ui' }}>↥</div>
+        <div style={{ font: '600 12.5px/1.3 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>{title}</div>
+        <div style={{ font: '400 10.5px/1.3 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>{sub}</div>
+      </div>
+    );
+  }
+
+  function UploadTrainStage({ pal, onBack, onTrain }) {
+    const data = window.SOHData;
+    const fileRef = React.useRef(null);
+    const [files, setFiles] = React.useState([]);
+    const [nomCap, setNomCap] = React.useState('5.0');
+    const [demoSel, setDemoSel] = React.useState(() => new Set(data.cellIds));
+    const onFiles = (e) => { const picked = Array.from(e.target.files || []); if (picked.length) setFiles(picked); };
+    const toggleDemo = (id) => setDemoSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+    const hasReal = files.length > 0;
+    const canTrain = hasReal || demoSel.size >= 2;
+    const go = () => {
+      if (hasReal) onTrain(files.map(f => f.name.replace(/\.csv$/i, '')), files, parseFloat(nomCap) || 5.0);
+      else onTrain([...demoSel], null, null);
+    };
+    return (
+      <div style={{ height: '100%', overflow: 'auto' }}>
+        <div style={{ width: 'min(820px, 100%)', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 15 }}>
+          <BackLink onBack={onBack} label="Model library" crumb="Train new model" />
+          <input ref={fileRef} type="file" multiple accept=".csv" style={{ display: 'none' }} onChange={onFiles} />
+          <Dropzone title={hasReal ? files.length + ' file' + (files.length > 1 ? 's' : '') + ' selected' : 'Click to upload cycle CSVs'} sub={hasReal ? files.map(f => f.name).join(', ') : 'Oxford / Severson format · one file per cell'} onClick={() => fileRef.current && fileRef.current.click()} />
+          {hasReal && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 9, padding: '10px 14px' }}>
+              <span style={{ font: '500 11.5px/1 "IBM Plex Sans", sans-serif', color: 'var(--dim)', flex: '0 0 auto' }}>Nominal capacity (Ah)</span>
+              <input type="number" step="0.1" min="0.1" value={nomCap} onChange={e => setNomCap(e.target.value)}
+                style={{ width: 72, height: 28, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--panel-2)', color: 'var(--text)', font: '500 13px/1 "IBM Plex Mono", monospace', textAlign: 'right', padding: '0 8px', outline: 'none' }} />
+            </div>
+          )}
+          {!hasReal && (
+            <Panel title="Or use demo batch" sub="select cells for cross-validation" right={<span style={{ font: '500 10.5px/1 "IBM Plex Mono", monospace', color: 'var(--accent)' }}>{demoSel.size} selected</span>} flush>
+              <div>
+                {data.cells.map((c, i) => {
+                  const on = demoSel.has(c.id);
+                  return (
+                    <button key={c.id} onClick={() => toggleDemo(c.id)} style={rowBtn(i)}>
+                      <Check on={on} />
+                      <span style={{ font: '600 12.5px/1.2 "IBM Plex Mono", monospace', color: 'var(--text)', flex: '0 0 92px' }}>{c.id}</span>
+                      <span style={{ font: '400 11px/1.2 "IBM Plex Mono", monospace', color: 'var(--dim)', flex: '1 1 auto' }}>{c.id.toLowerCase()}_cycle.csv</span>
+                      <span style={{ font: '400 11px/1.2 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>{fmt.cyc(c.maxCycle)} cyc · {c.tempC}°C</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </Panel>
+          )}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+            <PrimaryBtn disabled={!canTrain} onClick={go}>Train model →</PrimaryBtn>
+            <span style={{ font: '400 11px/1.4 "IBM Plex Sans", sans-serif', color: 'var(--faint)' }}>
+              {hasReal ? 'Upload ' + files.length + ' cell' + (files.length > 1 ? 's' : '') + ' → LOCO cross-validation' : demoSel.size < 2 ? 'Select at least 2 cells' : 'Demo mode · LOCO CV across ' + demoSel.size + ' cells'}
+            </span>
+          </div>
+          <div style={{ height: 8 }} />
+        </div>
+      </div>
+    );
+  }
+
+  function UploadPredictStage({ pal, model, onBack, onPredict }) {
+    const data = window.SOHData;
+    const fileRef = React.useRef(null);
+    const [file, setFile] = React.useState(null);
+    const [nomCap, setNomCap] = React.useState('5.0');
+    const compatible = model && model.cellIds && model.cellIds.length ? model.cellIds : data.cellIds;
+    const [demoPick, setDemoPick] = React.useState(compatible[0]);
+    const onFile = (e) => { const f = e.target.files && e.target.files[0]; if (f) setFile(f); };
+    const hasReal = !!file && !!model && !model.seed;
+    const go = () => {
+      if (hasReal) onPredict(file.name.replace(/\.csv$/i, ''), file, parseFloat(nomCap) || 5.0);
+      else onPredict(demoPick, null, null);
+    };
+    return (
+      <div style={{ height: '100%', overflow: 'auto' }}>
+        <div style={{ width: 'min(820px, 100%)', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 15 }}>
+          <BackLink onBack={onBack} label="Model library" crumb={model ? model.name + ' · predict' : 'predict'} />
+          {model && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 14, background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 11, padding: '13px 16px' }}>
+              <div style={{ flex: '1 1 auto' }}>
+                <div style={{ font: '600 13px/1.2 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>{model.name}</div>
+                <div style={{ font: '400 10.5px/1.3 "IBM Plex Mono", monospace', color: 'var(--faint)', marginTop: 3 }}>{model.type} · {model.form} · trained on {model.cells} cells</div>
+              </div>
+              <StatTile label="R²" value={model.r2.toFixed(3)} tone="accent" />
+              <StatTile label="RMSE" value={model.rmse.toFixed(4)} />
+            </div>
+          )}
+          <input ref={fileRef} type="file" accept=".csv" style={{ display: 'none' }} onChange={onFile} />
+          <Dropzone title={file ? file.name : 'Click to upload a cell CSV to score'} sub={file ? (file.size / 1024).toFixed(0) + ' KB · click to change' : (model && !model.seed ? model.type + ' cell · same protocol as training' : 'Upload a real cell or pick a demo below')} onClick={() => fileRef.current && fileRef.current.click()} />
+          {file && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 9, padding: '10px 14px' }}>
+              <span style={{ font: '500 11.5px/1 "IBM Plex Sans", sans-serif', color: 'var(--dim)', flex: '0 0 auto' }}>Nominal capacity (Ah)</span>
+              <input type="number" step="0.1" min="0.1" value={nomCap} onChange={e => setNomCap(e.target.value)}
+                style={{ width: 72, height: 28, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--panel-2)', color: 'var(--text)', font: '500 13px/1 "IBM Plex Mono", monospace', textAlign: 'right', padding: '0 8px', outline: 'none' }} />
+            </div>
+          )}
+          {!file && (
+            <Panel title="Or score a demo cell" sub="pick one" flush>
+              <div>
+                {compatible.map((id, i) => {
+                  const c = data.byId[id]; if (!c) return null;
+                  const on = id === demoPick;
+                  return (
+                    <button key={id} onClick={() => setDemoPick(id)} style={rowBtn(i)}>
+                      <Radio on={on} />
+                      <span style={{ font: '600 12.5px/1.2 "IBM Plex Mono", monospace', color: 'var(--text)', flex: '0 0 92px' }}>{c.id}</span>
+                      <span style={{ font: '400 11px/1.2 "IBM Plex Mono", monospace', color: 'var(--dim)', flex: '1 1 auto' }}>{c.id.toLowerCase()}_cycle.csv</span>
+                      <span style={{ font: '400 11px/1.2 "IBM Plex Mono", monospace', color: 'var(--faint)' }}>{fmt.cyc(c.maxCycle)} cyc · {c.tempC}°C</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </Panel>
+          )}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+            <PrimaryBtn onClick={go}>Run prediction →</PrimaryBtn>
+            <span style={{ font: '400 11px/1.4 "IBM Plex Sans", sans-serif', color: 'var(--faint)' }}>
+              {hasReal ? 'Extract dQ/dV → ΔQ(V) features → SOH + mechanism report' : 'Demo mode · uses synthetic data'}
+            </span>
+          </div>
+          <div style={{ height: 8 }} />
+        </div>
+      </div>
+    );
+  }
+
+  function BackLink({ onBack, label, crumb }) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, font: '500 11.5px/1 "IBM Plex Sans", sans-serif' }}>
+        <button onClick={onBack} style={{ color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', font: 'inherit', padding: 0 }}>← {label}</button>
+        <span style={{ color: 'var(--faint)' }}>/</span>
+        <span style={{ color: 'var(--dim)' }}>{crumb}</span>
+      </div>
+    );
+  }
+  function PrimaryBtn({ children, onClick, disabled }) {
+    return <button onClick={() => !disabled && onClick()} disabled={disabled} style={{ font: '600 13px/1 "IBM Plex Sans", sans-serif', color: '#06120f', background: disabled ? 'var(--track)' : 'var(--accent)', border: 'none', borderRadius: 9, padding: '12px 20px', cursor: disabled ? 'default' : 'pointer', boxShadow: disabled ? 'none' : '0 4px 16px -6px var(--accent)' }}>{children}</button>;
+  }
+  function Check({ on }) { return <span style={{ width: 17, height: 17, borderRadius: 5, border: '1.5px solid ' + (on ? 'var(--accent)' : 'var(--faint)'), background: on ? 'var(--accent)' : 'transparent', color: '#06120f', display: 'grid', placeItems: 'center', font: '700 11px/1 system-ui', flex: '0 0 auto' }}>{on ? '✓' : ''}</span>; }
+  function Radio({ on }) { return <span style={{ width: 16, height: 16, borderRadius: '50%', border: '1.5px solid ' + (on ? 'var(--accent)' : 'var(--faint)'), display: 'grid', placeItems: 'center', flex: '0 0 auto' }}>{on && <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--accent)' }} />}</span>; }
+  const rowBtn = (i) => ({ display: 'flex', alignItems: 'center', gap: 12, width: '100%', textAlign: 'left', padding: '11px 16px', cursor: 'pointer', background: 'transparent', border: 'none', borderTop: i ? '1px solid var(--border)' : 'none' });
+
+  window.SOHLanding = { seedModels, LandingStage, UploadTrainStage, UploadPredictStage };
+})();
+
+</script>
+<script type="text/babel">
+/* soh-stages.jsx */
+(function () {
+  const P = () => window.SOHFlowParts;
+  const L = () => window.SOHLanding;
+
+  function TrainingStage({ cellIds, jobId, onDone }) {
+    const data = window.SOHData;
+    const [prog, setProg] = React.useState(0);
+    const [fold, setFold] = React.useState(0);
+    const [errMsg, setErrMsg] = React.useState(null);
+    React.useEffect(() => {
+      if (jobId) {
+        let alive = true;
+        const poll = async () => {
+          try {
+            const res = await fetch('/api/jobs/' + jobId);
+            const d = await res.json();
+            if (!alive) return;
+            const p = d.progress || 0;
+            setProg(p);
+            setFold(Math.min(cellIds.length, Math.floor(p * cellIds.length) + 1));
+            if (d.status === 'done') { setTimeout(() => onDone(d), 400); return; }
+            if (d.status === 'failed') { setErrMsg(d.error || 'Pipeline failed'); return; }
+            setTimeout(poll, 700);
+          } catch (_) { if (alive) setTimeout(poll, 1500); }
+        };
+        poll();
+        return () => { alive = false; };
+      } else {
+        const total = 2200, t0 = performance.now(); let timer;
+        const tick = () => {
+          const p = Math.min(1, (performance.now() - t0) / total);
+          setProg(p); setFold(Math.min(cellIds.length, Math.floor(p * cellIds.length) + 1));
+          if (p < 1) timer = setTimeout(tick, 60); else setTimeout(() => onDone(null), 480);
+        };
+        tick(); return () => clearTimeout(timer);
+      }
+    }, [jobId]);
+    return (
+      <Centered>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ font: '600 16px/1.2 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>Training SOH model</div>
+          <div style={{ font: '400 11.5px/1.4 "IBM Plex Mono", monospace', color: 'var(--dim)', marginTop: 5 }}>ElasticNet · leave-one-cell-out cross-validation</div>
+        </div>
+        {errMsg ? <div style={{ font: '400 12px/1.5 "IBM Plex Mono", monospace', color: 'var(--danger)', textAlign: 'center', padding: '0 20px' }}>Error: {errMsg}</div> : <Bar prog={prog} />}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+          {cellIds.map((id, i) => {
+            const st = prog >= 1 || i < fold - 1 ? 'done' : i === fold - 1 ? 'run' : 'wait';
+            return (
+              <div key={id} style={{ display: 'flex', alignItems: 'center', gap: 10, font: '400 11.5px/1 "IBM Plex Mono", monospace', color: st === 'wait' ? 'var(--faint)' : 'var(--dim)' }}>
+                <Dot st={st} /><span>fold {i + 1} — hold out {id}</span>{st === 'run' && <span style={{ color: 'var(--accent)' }}>training…</span>}
+              </div>
+            );
+          })}
+        </div>
+        <div style={{ textAlign: 'center', font: '600 12px/1 "IBM Plex Mono", monospace', color: 'var(--accent)' }}>
+          {prog >= 1 ? 'R² ' + data.overall.r2.toFixed(3) + ' · RMSE ' + data.overall.rmse.toFixed(4) : Math.round(prog * 100) + '%'}
+        </div>
+      </Centered>
+    );
+  }
+
+  function PredictingStage({ cellId, predictPromise, onDone }) {
+    const steps = ['Extract dQ/dV ICA curves', 'Compute ΔQ(V) features', 'Predict SOH (ElasticNet)', 'Interpret degradation mechanisms'];
+    const [prog, setProg] = React.useState(0);
+    const [errMsg, setErrMsg] = React.useState(null);
+    React.useEffect(() => {
+      const total = 1500, t0 = performance.now(); let timer;
+      const cap = predictPromise ? 0.88 : 1.0;
+      const tick = () => {
+        const p = Math.min(cap, (performance.now() - t0) / total);
+        setProg(p);
+        if (p < cap) timer = setTimeout(tick, 55);
+        else if (!predictPromise) setTimeout(() => onDone(null), 380);
+      };
+      tick();
+      if (predictPromise) {
+        predictPromise
+          .then(d => { clearTimeout(timer); setProg(1); setTimeout(() => onDone(d), 380); })
+          .catch(e => { clearTimeout(timer); setErrMsg((e && e.message) || 'Prediction failed'); });
+      }
+      return () => clearTimeout(timer);
+    }, []);
+    const active = Math.min(steps.length, Math.floor(prog * steps.length) + 1);
+    return (
+      <Centered>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ font: '600 16px/1.2 "IBM Plex Sans", sans-serif', color: 'var(--text)' }}>Scoring {cellId}</div>
+          <div style={{ font: '400 11.5px/1.4 "IBM Plex Mono", monospace', color: 'var(--dim)', marginTop: 5 }}>running the interpretable SOH pipeline</div>
+        </div>
+        {errMsg ? <div style={{ font: '400 12px/1.5 "IBM Plex Mono", monospace', color: 'var(--danger)', textAlign: 'center' }}>Error: {errMsg}</div> : <Bar prog={prog} />}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {steps.map((s, i) => { const st = prog >= 1 || i < active - 1 ? 'done' : i === active - 1 ? 'run' : 'wait';
+            return <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 10, font: '400 12px/1 "IBM Plex Sans", sans-serif', color: st === 'wait' ? 'var(--faint)' : 'var(--dim)' }}><Dot st={st} /><span>{s}</span></div>;
+          })}
+        </div>
+      </Centered>
+    );
+  }
+
+  function ReportStage({ cell, selIdx, setIdx, setCell, pal, showBand, showGuide, setGuide, model, scopeIds, mode, batchCell }) {
+    const dominant = cell.rows[selIdx].phys.dominant, conf = cell.rows[selIdx].phys.conf;
+    const titlePrefix = cell.isBatch ? 'Batch average' : cell.id;
+    const MainCol = (
+      <div style={{ display: 'grid', gridTemplateRows: mode === 'single' ? 'auto auto 1fr auto auto' : 'auto 1fr auto auto', gap: 12, minHeight: 0 }}>
+        {mode === 'single' && <SingleSummary cell={cell} model={model} selIdx={selIdx} pal={pal} />}
+        <Explainer pal={pal} accent={pal.accent} collapsed={!showGuide} onToggle={() => setGuide(!showGuide)} />
+        <Panel title={titlePrefix + ' · State of Health'} sub={cell.isBatch ? 'mean predicted trajectory' : 'predicted vs. measured'}
+          right={<div style={{ display: 'flex', alignItems: 'center', gap: 14 }}><MechBadge dominant={dominant} confidence={conf} /><Scrubber cell={cell} selIdx={selIdx} onSelect={setIdx} pal={pal} /></div>}
+          bodyStyle={{ padding: 8 }} style={{ minHeight: 200 }}>
+          <SOHLine cell={cell} selIdx={selIdx} onSelect={setIdx} pal={pal} showBand={showBand} showPhases />
+        </Panel>
+        <Panel title="Mechanism timeline" sub={cell.isBatch ? 'mean dominant pathway over life' : 'dominant pathway over cycle life'} right={<TimelineLegend />} bodyStyle={{ padding: '8px 8px 4px' }} style={{ flex: '0 0 auto' }}>
+          <div style={{ height: 78 }}><MechTimeline cell={cell} selIdx={selIdx} onSelect={setIdx} pal={pal} /></div>
+        </Panel>
+        <div style={{ flex: '0 0 auto' }}><MechReport cell={cell} selIdx={selIdx} /></div>
+      </div>
+    );
+    if (mode === 'single') return <div style={{ height: '100%', minHeight: 0 }}>{MainCol}</div>;
+    return (
+      <div style={{ display: 'grid', gridTemplateColumns: '252px 1fr', gap: 12, height: '100%', minHeight: 0 }}>
+        <LeftRail cell={cell} selIdx={selIdx} onSelectCell={setCell} pal={pal} model={model} scopeIds={scopeIds} batchCell={batchCell} />
+        {MainCol}
+      </div>
+    );
+  }
+
+  function Centered({ children }) { return <div style={{ display: 'grid', placeItems: 'center', height: '100%' }}><div style={{ width: 'min(560px, 100%)', display: 'flex', flexDirection: 'column', gap: 20 }}>{children}</div></div>; }
+  function Bar({ prog }) { return <div style={{ height: 7, borderRadius: 4, background: 'var(--track)', overflow: 'hidden' }}><div style={{ height: '100%', width: prog * 100 + '%', background: 'var(--accent)', borderRadius: 4, boxShadow: '0 0 10px var(--accent)', transition: 'width .08s linear' }} /></div>; }
+  function Dot({ st }) { return <span style={{ width: 14, height: 14, borderRadius: '50%', display: 'grid', placeItems: 'center', font: '700 9px/1 system-ui', flex: '0 0 auto', background: st === 'done' ? 'var(--accent)' : 'transparent', border: st === 'done' ? 'none' : '1.5px solid ' + (st === 'run' ? 'var(--accent)' : 'var(--faint)'), color: '#06120f' }}>{st === 'done' ? '✓' : ''}</span>; }
+
+  function SOHFlow({ theme = 'dark', accent = 'teal', density = 'comfortable', showBand = true }) {
+    const { ACCENTS, buildPal, rootVars } = P();
+    const { seedModels, LandingStage, UploadTrainStage, UploadPredictStage } = L();
+    const data = window.SOHData;
+    const [stage, setStage] = React.useState('landing');
+    const [models, setModels] = React.useState(() => seedModels(data));
+    const [activeModel, setActiveModel] = React.useState(null);
+    const [scopeIds, setScopeIds] = React.useState(data.cellIds);
+    const [trainIds, setTrainIds] = React.useState(data.cellIds);
+    const [reportMode, setReportMode] = React.useState('batch');
+    const [batchCell, setBatchCell] = React.useState(null);
+    const [viewBatch, setViewBatch] = React.useState(false);
+    const [cellId, setCellId] = React.useState('Cell_01');
+    const [selIdx, setSelIdx] = React.useState(() => Math.round(data.byId['Cell_01'].nCycles * 0.82));
+    const [showGuide, setShowGuide] = React.useState(true);
+    const [jobId, setJobId] = React.useState(null);
+    const predictPromiseRef = React.useRef(null);
+    const displayed = (reportMode === 'batch' && viewBatch && batchCell) ? batchCell : (data.byId[cellId] || data.byId[data.cellIds[0]]);
+    const cell = displayed;
+    const si = Math.min(selIdx, cell.nCycles - 1);
+
+    React.useEffect(() => {
+      fetch('/api/models').then(r => r.json()).then(apiModels => {
+        if (Array.isArray(apiModels) && apiModels.length > 0) {
+          setModels(prev => {
+            const realIds = new Set(apiModels.map(m => m.id));
+            return [...apiModels, ...prev.filter(m => m.seed && !realIds.has(m.id))];
+          });
+        }
+      }).catch(() => {});
+    }, []);
+
+    const setCell = (id) => {
+      if (id === 'BATCH') { setViewBatch(true); setSelIdx(p => Math.min(p, (batchCell ? batchCell.nCycles : 81) - 1)); return; }
+      const c = data.byId[id]; if (!c) return;
+      setViewBatch(false); setCellId(id); setSelIdx(p => Math.min(p, c.nCycles - 1));
+    };
+    const goTrain = () => setStage('uploadTrain');
+    const startTrain = (ids, files, nomCap) => {
+      const useIds = ids && ids.length ? ids : data.cellIds;
+      setTrainIds(useIds); setJobId(null);
+      if (files && files.length > 0) {
+        const fd = new FormData();
+        for (const f of files) fd.append('files', f);
+        fd.append('nominal_capacity_ah', String(nomCap || 5.0));
+        fetch('/api/train', { method: 'POST', body: fd })
+          .then(r => r.json()).then(res => { if (res.job_id) setJobId(res.job_id); }).catch(() => {});
+      }
+      setStage('training');
+    };
+    const finishTrain = (jobData) => {
+      if (jobData && jobData.cells && Object.keys(jobData.cells).length > 0) {
+        const realIds = Object.keys(jobData.cells);
+        for (const [id, cellData] of Object.entries(jobData.cells)) {
+          data.byId[id] = cellData;
+          if (!data.cellIds.includes(id)) data.cellIds.push(id);
+        }
+        const nm = jobData.model;
+        if (nm) { setModels(m => [nm, ...m.filter(x => x.id !== nm.id)]); setActiveModel(nm); }
+        setScopeIds(realIds);
+        const bc = jobData.batch;
+        if (bc) { bc.nCells = realIds.length; setBatchCell(bc); }
+        setViewBatch(!!bc); setReportMode(bc ? 'batch' : 'single');
+        if (realIds[0] && data.byId[realIds[0]]) { setCellId(realIds[0]); setSelIdx(0); }
+      } else {
+        const ids = trainIds;
+        const nextV = Math.max(3, ...models.filter(m => m.typeKey === 'nmc').map(m => +(m.name.match(/v(\d+)/) || [0, 0])[1])) + 1;
+        const nm = { id: 'm_' + Date.now(), name: 'NMC-pouch · v' + nextV, typeKey: 'nmc', type: 'Graphite / NMC', form: 'Oxford pouch', cells: ids.length, cellIds: ids, r2: data.overall.r2, rmse: data.overall.rmse, mae: data.overall.mae, date: '2026-05-30' };
+        setModels(m => [nm, ...m]); setActiveModel(nm); setScopeIds(ids);
+        const bc = data.buildBatch(ids); setBatchCell(bc); setViewBatch(true); setReportMode('batch');
+        setCellId(ids[0]); setSelIdx(Math.round(bc.nCycles * 0.8));
+      }
+      setStage('report');
+    };
+    const useModel = (m) => {
+      setActiveModel(m);
+      const ids = m.cellIds && m.cellIds.length ? m.cellIds : data.cellIds;
+      setScopeIds(ids); setStage('uploadPredict');
+    };
+    const runPredict = (id, file, nomCap) => {
+      predictPromiseRef.current = null;
+      const safeId = id || data.cellIds[0];
+      setScopeIds([safeId]); setReportMode('single'); setViewBatch(false);
+      if (data.byId[safeId]) { setCellId(safeId); setSelIdx(Math.round(data.byId[safeId].nCycles * 0.82)); }
+      if (file && activeModel && !activeModel.seed) {
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('model_id', activeModel.id);
+        fd.append('nominal_capacity_ah', String(nomCap || 5.0));
+        predictPromiseRef.current = fetch('/api/predict', { method: 'POST', body: fd }).then(r => {
+          if (!r.ok) return r.json().then(e => Promise.reject(new Error(e.error || r.statusText)));
+          return r.json();
+        });
+      }
+      setStage('predicting');
+    };
+    const onPredictDone = (apiData) => {
+      if (apiData && apiData.cell) {
+        const cd = apiData.cell;
+        data.byId[cd.id] = cd; if (!data.cellIds.includes(cd.id)) data.cellIds.push(cd.id);
+        setCellId(cd.id); setSelIdx(0); setScopeIds([cd.id]);
+      }
+      setStage('report');
+    };
+    const toLibrary = () => setStage('landing');
+    const rgb = ACCENTS[accent] || ACCENTS.teal;
+    const pal = React.useMemo(() => buildPal(theme, rgb), [theme, accent]);
+    const vars = React.useMemo(() => rootVars(theme, rgb), [theme, accent]);
+    const c = density === 'compact';
+    return (
+      <TweakCtx.Provider value={{ density }}>
+        <div style={{ ...vars, width: '100%', height: '100%', boxSizing: 'border-box', padding: c ? 14 : 18, fontFamily: '"IBM Plex Sans", system-ui, sans-serif', display: 'flex', flexDirection: 'column', gap: 14, overflow: 'hidden' }}>
+          <header style={{ display: 'flex', alignItems: 'center', gap: 16, flex: '0 0 auto' }}>
+            <button onClick={toLibrary} style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+              <div style={{ width: 26, height: 26, borderRadius: 7, background: 'var(--accent)', display: 'grid', placeItems: 'center', color: '#06120f', font: '700 13px/1 "IBM Plex Mono", monospace' }}>S</div>
+              <div style={{ textAlign: 'left' }}>
+                <div style={{ font: '600 14px/1.1 "IBM Plex Sans", sans-serif', color: 'var(--text)', margin: '0px 0px 10px' }}>SOH Prediction</div>
+                <div style={{ font: '400 9.5px/1.2 "IBM Plex Mono", monospace', color: 'var(--faint)', lineHeight: '1.4', margin: '10px 1px 1px' }}>dQ/dV · batch training</div>
+              </div>
+            </button>
+            {stage === 'report' && activeModel && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, font: '500 11.5px/1 "IBM Plex Sans", sans-serif' }}>
+                <span style={{ color: 'var(--faint)' }}>/</span>
+                <button onClick={toLibrary} style={{ color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', font: 'inherit', padding: 0 }}>{activeModel.name}</button>
+                <span style={{ color: 'var(--faint)' }}>/</span>
+                <span style={{ color: 'var(--dim)' }}>{reportMode === 'single' ? 'prediction' : 'batch report'}</span>
+              </div>
+            )}
+            {stage === 'report' && (
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: 22, alignItems: 'center' }}>
+                <StatTile label="Pred SOH" value={fmt.soh(cell.sohPred[si])} tone="accent" />
+                <StatTile label="RUL → 80%" value={cell.rul ? fmt.cyc(cell.rul) : '—'} unit={cell.rul ? 'cyc' : ''} />
+                <StatTile label={cell.isBatch ? 'Batch end' : 'Dominant'} value={cell.cellDominant === 'EARLY' ? '—' : data.MECH[cell.cellDominant].short} />
+              </div>
+            )}
+          </header>
+          <div style={{ flex: '1 1 auto', minHeight: 0 }}>
+            {stage === 'landing'       && <LandingStage pal={pal} models={models} onTrainNew={goTrain} onUseModel={useModel} />}
+            {stage === 'uploadTrain'   && <UploadTrainStage pal={pal} onBack={toLibrary} onTrain={startTrain} />}
+            {stage === 'training'      && <TrainingStage cellIds={trainIds} jobId={jobId} onDone={finishTrain} />}
+            {stage === 'uploadPredict' && <UploadPredictStage pal={pal} model={activeModel} onBack={toLibrary} onPredict={runPredict} />}
+            {stage === 'predicting'    && <PredictingStage cellId={cellId} predictPromise={predictPromiseRef.current} onDone={onPredictDone} />}
+            {stage === 'report'        && <ReportStage cell={cell} selIdx={si} setIdx={setSelIdx} setCell={setCell} pal={pal} showBand={showBand} showGuide={showGuide} setGuide={setShowGuide} model={activeModel} scopeIds={scopeIds} mode={reportMode} batchCell={batchCell} />}
+          </div>
+        </div>
+      </TweakCtx.Provider>
+    );
+  }
+
+  window.SOHFlow = SOHFlow;
+  window.ACCENTS = window.SOHFlowParts.ACCENTS;
+})();
+
+</script>
+
+<script type="text/babel" data-presets="react">
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "dark": true,
+  "accent": "teal",
+  "density": "comfortable",
+  "showBand": true
+}/*EDITMODE-END*/;
+
+function App() {
+  const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+  const theme = t.dark ? 'dark' : 'light';
+  return (
+    <React.Fragment>
+      <SOHFlow theme={theme} accent={t.accent} density={t.density} showBand={t.showBand} />
+      <TweaksPanel>
+        <TweakSection label="Appearance" />
+        <TweakToggle label="Dark theme" value={t.dark} onChange={(v) => setTweak('dark', v)} />
+        <TweakColor label="Accent" value={'rgb(' + (ACCENTS[t.accent] || ACCENTS.teal).join(',') + ')'}
+          options={Object.keys(ACCENTS).map((k) => 'rgb(' + ACCENTS[k].join(',') + ')')}
+          onChange={(v) => { const key = Object.keys(ACCENTS).find((k) => 'rgb(' + ACCENTS[k].join(',') + ')' === v); if (key) setTweak('accent', key); }} />
+        <TweakRadio label="Density" value={t.density} options={['comfortable', 'compact']} onChange={(v) => setTweak('density', v)} />
+        <TweakSection label="Charts" />
+        <TweakToggle label="Uncertainty band" value={t.showBand} onChange={(v) => setTweak('showBand', v)} />
+      </TweaksPanel>
+    </React.Fragment>
+  );
+}
+
+document.getElementById('loading').remove();
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
